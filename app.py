@@ -17,7 +17,7 @@ PROMPT  = (
     "No explanation, no punctuation, just one letter."
 )
 
-_k = ["QUl6YVN5RDl2N", "DM0R29HR3kwWn", "BmcDhpWXR4TUk", "tQUZKTGh6eDYw"]
+_k = ["QUl6YVN5Q0lhZ", "DcxLTV1VWFabT", "NaM2tUbnRMc2c", "1UzVGbWlZRzZz"]
 API_KEY = base64.b64decode("".join(_k)).decode()
 
 state = {
