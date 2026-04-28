@@ -3,14 +3,19 @@ import time
 import io
 import sys
 import os
+import json
+import base64
+import urllib.request
+import urllib.error
 
 from PIL import ImageGrab
-from google import genai
-from google.genai import types
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyD9v434GoGGy0Zpfp8iYtxMI-AFJLhzx60"
-client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_API_KEY = "AIzaSyBxSp8TBKcfvSN9OJ3uHdpMlQ8QQA2lpjs"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash-latest:generateContent?key=" + GEMINI_API_KEY
+)
 
 state = {
     "is_loading": False,
@@ -18,45 +23,55 @@ state = {
 }
 
 # ── AI capture ────────────────────────────────────────────────────────────────
-MODELS = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
-
 def capture_and_ask(update_fn, show_fn):
     time.sleep(0.25)
     try:
         screenshot = ImageGrab.grab()
         buf = io.BytesIO()
         screenshot.save(buf, format="PNG")
-        buf.seek(0)
-        img_bytes = buf.getvalue()
+        img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-        last_err = None
-        for model in MODELS:
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=[
-                        types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-                        "Look at this exam/quiz question screenshot. "
-                        "Reply with ONLY a single letter: A, B, C, or D — the correct answer. "
-                        "No explanation, no punctuation, just one letter."
-                    ]
-                )
-                answer = next((c for c in response.text.strip().upper() if c in "ABCD"), None)
-                if answer:
-                    update_fn(answer, "Shift+A", "ok")
-                else:
-                    update_fn("!", "No answer", "err")
-                return
-            except Exception as e:
-                last_err = e
-                if "429" in str(e) or "quota" in str(e).lower() or "rate" in str(e).lower():
-                    time.sleep(2)
-                    continue  # try next model
-                raise  # non-rate-limit error, bail immediately
+        payload = json.dumps({
+            "contents": [{
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": img_b64
+                        }
+                    },
+                    {
+                        "text": (
+                            "Look at this exam/quiz question screenshot. "
+                            "Reply with ONLY a single letter: A, B, C, or D — the correct answer. "
+                            "No explanation, no punctuation, just one letter."
+                        )
+                    }
+                ]
+            }]
+        }).encode()
 
-        # All models exhausted
-        update_fn("!", "Rate limit", "err")
+        req = urllib.request.Request(
+            GEMINI_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
 
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read().decode())
+
+        raw = result["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
+        answer = next((c for c in raw if c in "ABCD"), None)
+
+        if answer:
+            update_fn(answer, "Shift+A", "ok")
+        else:
+            update_fn("!", "No answer", "err")
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:80]
+        update_fn("!", f"HTTP {e.code}", "err")
     except Exception as e:
         update_fn("!", str(e)[:12], "err")
     finally:
@@ -71,9 +86,16 @@ def run_ui():
 
     root = tk.Tk()
     root.title("ExamHelper")
-    root.attributes("-topmost", True)
-    root.attributes("-alpha", 0.92)
     root.overrideredirect(True)
+    root.attributes("-alpha", 0.92)
+
+    # ── Always on top — works on macOS even over fullscreen apps ──────────────
+    root.attributes("-topmost", True)
+    # macOS: set window level above everything (screen saver level = 1000)
+    try:
+        root.tk.call("::tk::unsupported::MacWindowStyle", "style", root._w, "help", "noActivates")
+    except Exception:
+        pass
 
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
@@ -112,9 +134,16 @@ def run_ui():
         answer_lbl.config(text=letter, fg=COLORS.get(letter, "#00ff88"))
         status_lbl.config(text=status,
                           fg="#888888" if mode == "ok" else "#ff4444")
+        # Re-assert on top after update
+        root.attributes("-topmost", True)
+        root.lift()
 
     def show_win():
-        root.after(0, root.deiconify)
+        def _show():
+            root.deiconify()
+            root.attributes("-topmost", True)
+            root.lift()
+        root.after(0, _show)
 
     def trigger(event=None):
         if state["is_loading"]:
@@ -133,6 +162,8 @@ def run_ui():
         if state["is_hidden"]:
             state["is_hidden"] = False
             root.deiconify()
+            root.attributes("-topmost", True)
+            root.lift()
         else:
             state["is_hidden"] = True
             root.withdraw()
@@ -141,16 +172,14 @@ def run_ui():
         root.destroy()
         sys.exit(0)
 
-    # ── Hotkeys: bind to tkinter window (works without Accessibility perms) ───
-    # These fire when the overlay window has focus
+    # ── Tkinter hotkeys (work when overlay is focused) ────────────────────────
     root.bind("<Shift-a>", trigger)
     root.bind("<Shift-A>", trigger)
     root.bind("<Shift-z>", toggle)
     root.bind("<Shift-Z>", toggle)
     root.bind("<F10>", quit_app)
 
-    # ── Global hotkeys via pynput (optional, needs Accessibility permission) ──
-    # Wrapped in a subprocess so a crash there won't kill the main UI
+    # ── Global hotkeys via pynput ─────────────────────────────────────────────
     def start_global_hotkeys():
         try:
             from pynput import keyboard as K
@@ -177,21 +206,18 @@ def run_ui():
             with K.Listener(on_press=on_press_key, on_release=on_release_key) as listener:
                 listener.join()
         except Exception:
-            # pynput failed (no Accessibility permission) — tkinter bindings still work
-            root.after(0, lambda: status_lbl.config(
-                text="Click+Shift+A", fg="#ffaa00"
-            ))
+            root.after(0, lambda: status_lbl.config(text="Click+Shft+A", fg="#ffaa00"))
 
     threading.Thread(target=start_global_hotkeys, daemon=True).start()
 
-    # Keep window focused so tkinter hotkeys always work
-    def keep_focus():
+    # ── Keep on top loop — re-asserts every second ────────────────────────────
+    def keep_on_top():
         if not state["is_hidden"]:
+            root.attributes("-topmost", True)
             root.lift()
-            root.focus_force()
-        root.after(2000, keep_focus)
+        root.after(1000, keep_on_top)
 
-    root.after(500, keep_focus)
+    root.after(500, keep_on_top)
     root.mainloop()
 
 
