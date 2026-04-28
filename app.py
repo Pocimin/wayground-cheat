@@ -11,10 +11,10 @@ import urllib.error
 from PIL import ImageGrab
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyBxSp8TBKcfvSN9OJ3uHdpMlQ8QQA2lpjs"
+GEMINI_API_KEY = "AIzaSyD9v434GoGGy0Zpfp8iYtxMI-AFJLhzx60"
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash-latest:generateContent?key=" + GEMINI_API_KEY
+    "gemini-flash-latest:generateContent?key=" + GEMINI_API_KEY
 )
 
 state = {
