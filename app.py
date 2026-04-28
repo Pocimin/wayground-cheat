@@ -5,16 +5,17 @@ import sys
 import os
 import json
 import base64
-import urllib.request
-import urllib.error
 
+import requests
 from PIL import ImageGrab
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyD9v434GoGGy0Zpfp8iYtxMI-AFJLhzx60"
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-flash-latest:generateContent?key=" + GEMINI_API_KEY
+API_KEY = "AIzaSyD9v434GoGGy0Zpfp8iYtxMI-AFJLhzx60"
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+PROMPT  = (
+    "Look at this exam/quiz question screenshot. "
+    "Reply with ONLY a single letter: A, B, C, or D — the correct answer. "
+    "No explanation, no punctuation, just one letter."
 )
 
 state = {
@@ -31,47 +32,35 @@ def capture_and_ask(update_fn, show_fn):
         screenshot.save(buf, format="PNG")
         img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-        payload = json.dumps({
+        payload = {
             "contents": [{
                 "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": img_b64
-                        }
-                    },
-                    {
-                        "text": (
-                            "Look at this exam/quiz question screenshot. "
-                            "Reply with ONLY a single letter: A, B, C, or D — the correct answer. "
-                            "No explanation, no punctuation, just one letter."
-                        )
-                    }
+                    {"inline_data": {"mime_type": "image/png", "data": img_b64}},
+                    {"text": PROMPT}
                 ]
             }]
-        }).encode()
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "X-goog-api-key": API_KEY,
+        }
 
-        req = urllib.request.Request(
-            GEMINI_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
+        resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        data = resp.json()
 
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read().decode())
-
-        raw = result["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
-        answer = next((c for c in raw if c in "ABCD"), None)
-
-        if answer:
-            update_fn(answer, "Shift+A", "ok")
+        if "candidates" in data:
+            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
+            answer = next((c for c in raw if c in "ABCD"), None)
+            if answer:
+                update_fn(answer, "Shift+A", "ok")
+            else:
+                update_fn("!", "No answer", "err")
+        elif "error" in data:
+            code = data["error"].get("code", "?")
+            update_fn("!", f"Err {code}", "err")
         else:
-            update_fn("!", "No answer", "err")
+            update_fn("!", "Bad resp", "err")
 
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:80]
-        update_fn("!", f"HTTP {e.code}", "err")
     except Exception as e:
         update_fn("!", str(e)[:12], "err")
     finally:
@@ -88,10 +77,8 @@ def run_ui():
     root.title("ExamHelper")
     root.overrideredirect(True)
     root.attributes("-alpha", 0.92)
-
-    # ── Always on top — works on macOS even over fullscreen apps ──────────────
     root.attributes("-topmost", True)
-    # macOS: set window level above everything (screen saver level = 1000)
+
     try:
         root.tk.call("::tk::unsupported::MacWindowStyle", "style", root._w, "help", "noActivates")
     except Exception:
@@ -117,8 +104,7 @@ def run_ui():
 
     # ── Drag ──────────────────────────────────────────────────────────────────
     drag = {"x": 0, "y": 0}
-    def on_press(e):
-        drag["x"], drag["y"] = e.x, e.y
+    def on_press(e):  drag["x"], drag["y"] = e.x, e.y
     def on_drag(e):
         root.geometry(f"+{root.winfo_x()+e.x-drag['x']}+{root.winfo_y()+e.y-drag['y']}")
     for w in (frame, answer_lbl, status_lbl):
@@ -132,9 +118,7 @@ def run_ui():
 
     def update_ui(letter, status, mode):
         answer_lbl.config(text=letter, fg=COLORS.get(letter, "#00ff88"))
-        status_lbl.config(text=status,
-                          fg="#888888" if mode == "ok" else "#ff4444")
-        # Re-assert on top after update
+        status_lbl.config(text=status, fg="#888888" if mode == "ok" else "#ff4444")
         root.attributes("-topmost", True)
         root.lift()
 
@@ -172,7 +156,7 @@ def run_ui():
         root.destroy()
         sys.exit(0)
 
-    # ── Tkinter hotkeys (work when overlay is focused) ────────────────────────
+    # ── Tkinter hotkeys ───────────────────────────────────────────────────────
     root.bind("<Shift-a>", trigger)
     root.bind("<Shift-A>", trigger)
     root.bind("<Shift-z>", toggle)
@@ -210,7 +194,7 @@ def run_ui():
 
     threading.Thread(target=start_global_hotkeys, daemon=True).start()
 
-    # ── Keep on top loop — re-asserts every second ────────────────────────────
+    # ── Keep on top loop ──────────────────────────────────────────────────────
     def keep_on_top():
         if not state["is_hidden"]:
             root.attributes("-topmost", True)
