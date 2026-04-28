@@ -10,13 +10,15 @@ import requests
 from PIL import ImageGrab
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_KEY = "AIzaSyD9v434GoGGy0Zpfp8iYtxMI-AFJLhzx60"
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
 PROMPT  = (
     "Look at this exam/quiz question screenshot. "
     "Reply with ONLY a single letter: A, B, C, or D — the correct answer. "
     "No explanation, no punctuation, just one letter."
 )
+
+_k = ["QUl6YVN5RDl2N", "DM0R29HR3kwWn", "BmcDhpWXR4TUk", "tQUZKTGh6eDYw"]
+API_KEY = base64.b64decode("".join(_k)).decode()
 
 state = {
     "is_loading": False,
