@@ -58,7 +58,7 @@ PIP="$VENV/bin/pip"
 # ── 4. Dependencies ───────────────────────────────────────────────────────────
 echo "▸ Installing dependencies..."
 "$PIP" install --quiet --upgrade pip
-"$PIP" install --quiet google-genai Pillow pynput
+"$PIP" install --quiet Pillow pynput
 echo "  ✓ Dependencies ready"
 
 # ── 5. Download app.py ────────────────────────────────────────────────────────
