@@ -9,7 +9,7 @@ from google import genai
 from google.genai import types
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyBxSp8TBKcfvSN9OJ3uHdpMlQ8QQA2lpjs"
+GEMINI_API_KEY = "AIzaSyD9v434GoGGy0Zpfp8iYtxMI-AFJLhzx60"
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 state = {
