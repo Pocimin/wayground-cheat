@@ -18,6 +18,8 @@ state = {
 }
 
 # ── AI capture ────────────────────────────────────────────────────────────────
+MODELS = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+
 def capture_and_ask(update_fn, show_fn):
     time.sleep(0.25)
     try:
@@ -25,21 +27,36 @@ def capture_and_ask(update_fn, show_fn):
         buf = io.BytesIO()
         screenshot.save(buf, format="PNG")
         buf.seek(0)
+        img_bytes = buf.getvalue()
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[
-                types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"),
-                "Look at this exam/quiz question screenshot. "
-                "Reply with ONLY a single letter: A, B, C, or D — the correct answer. "
-                "No explanation, no punctuation, just one letter."
-            ]
-        )
-        answer = next((c for c in response.text.strip().upper() if c in "ABCD"), None)
-        if answer:
-            update_fn(answer, "Shift+A", "ok")
-        else:
-            update_fn("!", "No answer", "err")
+        last_err = None
+        for model in MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                        "Look at this exam/quiz question screenshot. "
+                        "Reply with ONLY a single letter: A, B, C, or D — the correct answer. "
+                        "No explanation, no punctuation, just one letter."
+                    ]
+                )
+                answer = next((c for c in response.text.strip().upper() if c in "ABCD"), None)
+                if answer:
+                    update_fn(answer, "Shift+A", "ok")
+                else:
+                    update_fn("!", "No answer", "err")
+                return
+            except Exception as e:
+                last_err = e
+                if "429" in str(e) or "quota" in str(e).lower() or "rate" in str(e).lower():
+                    time.sleep(2)
+                    continue  # try next model
+                raise  # non-rate-limit error, bail immediately
+
+        # All models exhausted
+        update_fn("!", "Rate limit", "err")
+
     except Exception as e:
         update_fn("!", str(e)[:12], "err")
     finally:
