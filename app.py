@@ -4,7 +4,6 @@ import io
 import sys
 import os
 
-import pygame
 from PIL import ImageGrab
 from google import genai
 from google.genai import types
@@ -13,43 +12,17 @@ from google.genai import types
 GEMINI_API_KEY = "AIzaSyBxSp8TBKcfvSN9OJ3uHdpMlQ8QQA2lpjs"
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-WIN_W, WIN_H = 110, 110
-BG_COLOR      = (26, 26, 46)
-BORDER_COLOR  = (80, 80, 120)
-COLORS = {
-    "?": (0, 255, 136),
-    "A": (255, 107, 107),
-    "B": (255, 217, 61),
-    "C": (107, 203, 119),
-    "D": (77, 150, 255),
-    "!": (255, 68, 68),
-    ".": (255, 255, 255),
-}
-
-# ── State ─────────────────────────────────────────────────────────────────────
+# ── State shared between threads ──────────────────────────────────────────────
 state = {
-    "answer": "?",
-    "status": "Shift+A",
-    "status_color": (136, 136, 136),
     "is_loading": False,
     "is_hidden": False,
-    "dirty": True,   # redraw flag
 }
 
-def set_state(**kwargs):
-    state.update(kwargs)
-    state["dirty"] = True
-
-
-# ── Screenshot + AI ───────────────────────────────────────────────────────────
-def capture_and_ask():
-    set_state(is_loading=True, answer=".", status="Thinking...", status_color=(255, 170, 0))
-    time.sleep(0.2)  # let pygame hide the window first
-
+# ── AI capture (runs in background thread) ────────────────────────────────────
+def capture_and_ask(update_fn, show_fn):
+    time.sleep(0.25)  # wait for window to hide
     try:
         screenshot = ImageGrab.grab()
-
         buf = io.BytesIO()
         screenshot.save(buf, format="PNG")
         buf.seek(0)
@@ -63,157 +36,127 @@ def capture_and_ask():
                 "No explanation, no punctuation, just one letter."
             ]
         )
-
         answer = next((c for c in response.text.strip().upper() if c in "ABCD"), None)
-
         if answer:
-            set_state(is_loading=False, answer=answer, status="Shift+A", status_color=(136, 136, 136))
+            update_fn(answer, "Shift+A", "ok")
         else:
-            set_state(is_loading=False, answer="!", status="No answer", status_color=(255, 68, 68))
-
+            update_fn("!", "No answer", "err")
     except Exception as e:
-        set_state(is_loading=False, answer="!", status=str(e)[:12], status_color=(255, 68, 68))
+        update_fn("!", str(e)[:12], "err")
+    finally:
+        state["is_loading"] = False
+        if not state["is_hidden"]:
+            show_fn()
 
 
-def trigger_screenshot():
-    if state["is_loading"]:
-        return
-    threading.Thread(target=capture_and_ask, daemon=True).start()
+# ── UI using tkinter from the correct Python ──────────────────────────────────
+def run_ui():
+    import tkinter as tk
 
+    root = tk.Tk()
+    root.title("ExamHelper")
+    root.attributes("-topmost", True)
+    root.attributes("-alpha", 0.92)
+    root.overrideredirect(True)
 
-# ── Hotkeys (pynput — no root needed on Mac) ──────────────────────────────────
-def start_hotkeys(toggle_fn, quit_fn):
-    def run():
-        try:
-            from pynput import keyboard as pynput_kb
-            pressed = set()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    W, H = 110, 110
+    root.geometry(f"{W}x{H}+{sw - W - 20}+{sh - H - 60}")
 
-            def on_press(key):
-                try:
-                    k = key.char.lower() if hasattr(key, 'char') and key.char else key
-                except Exception:
-                    k = key
-                pressed.add(k)
+    frame = tk.Frame(root, bg="#1a1a2e", bd=2, relief="solid")
+    frame.pack(fill="both", expand=True)
 
-                shift = (pynput_kb.Key.shift in pressed or pynput_kb.Key.shift_r in pressed)
-                chars = {x for x in pressed if isinstance(x, str)}
+    answer_lbl = tk.Label(frame, text="?",
+                          font=("Arial Black", 52, "bold"),
+                          fg="#00ff88", bg="#1a1a2e")
+    answer_lbl.pack(expand=True)
 
-                if shift and 'a' in chars:
-                    trigger_screenshot()
-                elif shift and 'z' in chars:
-                    toggle_fn()
+    status_lbl = tk.Label(frame, text="Shift+A",
+                          font=("Arial", 9),
+                          fg="#888888", bg="#1a1a2e")
+    status_lbl.pack(pady=(0, 6))
 
-            def on_release(key):
-                try:
-                    k = key.char.lower() if hasattr(key, 'char') and key.char else key
-                except Exception:
-                    k = key
-                pressed.discard(k)
-                if key == pynput_kb.Key.f10:
-                    quit_fn()
+    # Drag
+    drag = {"x": 0, "y": 0}
+    def on_press(e):  drag["x"], drag["y"] = e.x, e.y
+    def on_drag(e):
+        root.geometry(f"+{root.winfo_x()+e.x-drag['x']}+{root.winfo_y()+e.y-drag['y']}")
+    for w in (frame, answer_lbl, status_lbl):
+        w.bind("<ButtonPress-1>", on_press)
+        w.bind("<B1-Motion>", on_drag)
 
-            with pynput_kb.Listener(on_press=on_press, on_release=on_release) as listener:
-                listener.join()
-        except Exception as e:
-            set_state(answer="!", status="No hotkey", status_color=(255, 68, 68))
+    COLORS = {"A":"#ff6b6b","B":"#ffd93d","C":"#6bcb77","D":"#4d96ff",
+              "!":"#ff4444","?":"#00ff88",".":"#ffffff"}
 
-    threading.Thread(target=run, daemon=True).start()
+    def update_ui(letter, status, mode):
+        answer_lbl.config(text=letter, fg=COLORS.get(letter, "#00ff88"))
+        status_lbl.config(
+            text=status,
+            fg="#888888" if mode == "ok" else "#ff4444"
+        )
 
+    def show_win():
+        root.after(0, root.deiconify)
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-def main():
-    os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,0")  # will be repositioned
+    def trigger():
+        if state["is_loading"]:
+            return
+        state["is_loading"] = True
+        answer_lbl.config(text="...", fg="#ffffff")
+        status_lbl.config(text="Thinking...", fg="#ffaa00")
+        root.withdraw()
+        threading.Thread(
+            target=capture_and_ask,
+            args=(lambda l, s, m: root.after(0, lambda: update_ui(l, s, m)), show_win),
+            daemon=True
+        ).start()
 
-    pygame.init()
-    pygame.display.set_caption("ExamHelper")
-
-    # Get screen size to position bottom-right
-    info = pygame.display.Info()
-    sw, sh = info.current_w, info.current_h
-    win_x = sw - WIN_W - 20
-    win_y = sh - WIN_H - 60
-
-    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{win_x},{win_y}"
-
-    flags = pygame.NOFRAME
-    screen = pygame.display.set_mode((WIN_W, WIN_H), flags)
-
-    # Fonts
-    font_big   = pygame.font.SysFont("Arial Black", 52, bold=True)
-    font_small = pygame.font.SysFont("Arial", 11)
-
-    clock = pygame.time.Clock()
-
-    # Drag state
-    dragging = False
-    drag_offset = (0, 0)
-
-    running = [True]
+    def toggle():
+        if state["is_hidden"]:
+            state["is_hidden"] = False
+            root.deiconify()
+        else:
+            state["is_hidden"] = True
+            root.withdraw()
 
     def quit_app():
-        running[0] = False
+        root.destroy()
+        sys.exit(0)
 
-    def toggle_visibility():
-        state["is_hidden"] = not state["is_hidden"]
-        state["dirty"] = True
-        if state["is_hidden"]:
-            pygame.display.iconify()
-        else:
-            pygame.display.set_mode((WIN_W, WIN_H), flags)
+    # Hotkeys via pynput
+    def start_hotkeys():
+        try:
+            from pynput import keyboard as K
+            pressed = set()
 
-    start_hotkeys(toggle_visibility, quit_app)
+            def on_press_key(key):
+                try:    k = key.char.lower() if key.char else key
+                except: k = key
+                pressed.add(k)
+                shift = K.Key.shift in pressed or K.Key.shift_r in pressed
+                chars = {x for x in pressed if isinstance(x, str)}
+                if shift and 'a' in chars:
+                    root.after(0, trigger)
+                elif shift and 'z' in chars:
+                    root.after(0, toggle)
 
-    while running[0]:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running[0] = False
+            def on_release_key(key):
+                try:    k = key.char.lower() if key.char else key
+                except: k = key
+                pressed.discard(k)
+                if key == K.Key.f10:
+                    root.after(0, quit_app)
 
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                dragging = True
-                mx, my = pygame.mouse.get_pos()
-                wx, wy = pygame.display.get_wm_info().get("window", (0, 0)), 0
-                drag_offset = (mx, my)
+            with K.Listener(on_press=on_press_key, on_release=on_release_key) as l:
+                l.join()
+        except Exception as e:
+            root.after(0, lambda: status_lbl.config(text="No hotkey", fg="#ff4444"))
 
-            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                dragging = False
+    threading.Thread(target=start_hotkeys, daemon=True).start()
 
-            elif event.type == pygame.MOUSEMOTION and dragging:
-                # Move window
-                abs_x, abs_y = pygame.mouse.get_pos()
-                # Use SDL to get window position
-                try:
-                    import ctypes
-                    # Works on most platforms via SDL
-                    pass
-                except Exception:
-                    pass
-
-        if state["dirty"]:
-            state["dirty"] = False
-
-            # Background
-            screen.fill(BG_COLOR)
-            pygame.draw.rect(screen, BORDER_COLOR, (0, 0, WIN_W, WIN_H), 2)
-
-            # Answer letter
-            letter = state["answer"]
-            color = COLORS.get(letter, (0, 255, 136))
-            text_surf = font_big.render(letter, True, color)
-            text_rect = text_surf.get_rect(center=(WIN_W // 2, WIN_H // 2 - 8))
-            screen.blit(text_surf, text_rect)
-
-            # Status text
-            status_surf = font_small.render(state["status"], True, state["status_color"])
-            status_rect = status_surf.get_rect(center=(WIN_W // 2, WIN_H - 12))
-            screen.blit(status_surf, status_rect)
-
-            pygame.display.flip()
-
-        clock.tick(30)
-
-    pygame.quit()
-    sys.exit(0)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    run_ui()
