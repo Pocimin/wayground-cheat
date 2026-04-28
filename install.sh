@@ -8,7 +8,7 @@ echo "  ║       ExamHelper Setup       ║"
 echo "  ╚══════════════════════════════╝"
 echo ""
 
-# ── 1. Install Homebrew if missing ───────────────────────────────────────────
+# ── 1. Homebrew ───────────────────────────────────────────────────────────────
 if ! command -v brew &>/dev/null; then
     echo "▸ Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -16,46 +16,49 @@ fi
 eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || true)"
 eval "$(/usr/local/bin/brew shellenv 2>/dev/null || true)"
 
-# ── 2. Get a working Python 3.11+ (not the broken macOS system one) ──────────
-echo "▸ Checking Python..."
+# ── 2. Python + tkinter via brew (python-tk installs both + links them) ───────
+echo "▸ Setting up Python with tkinter..."
+brew install python-tk@3.11 2>/dev/null || brew upgrade python-tk@3.11 2>/dev/null || true
 
-PYTHON=""
-for candidate in python3.12 python3.11 python3.10; do
-    if command -v "$candidate" &>/dev/null; then
-        PYVER=$("$candidate" -c "import sys; print(sys.version_info.minor + sys.version_info.major * 100)")
-        if [ "$PYVER" -ge 310 ]; then
-            PYTHON="$candidate"
-            break
-        fi
-    fi
-done
+# python-tk@3.11 installs python@3.11 as a dependency and links tcl-tk properly
+export PATH="$(brew --prefix python@3.11)/bin:$PATH"
+PYTHON="python3.11"
 
-if [ -z "$PYTHON" ]; then
-    echo "  Installing Python 3.11 via Homebrew..."
-    brew install python@3.11
-    export PATH="$(brew --prefix python@3.11)/bin:$PATH"
-    PYTHON="python3.11"
+# Verify tkinter works
+if ! "$PYTHON" -c "import tkinter" 2>/dev/null; then
+    echo "  tkinter still missing, trying python-tk@3.12..."
+    brew install python-tk@3.12 2>/dev/null || true
+    export PATH="$(brew --prefix python@3.12)/bin:$PATH"
+    PYTHON="python3.12"
 fi
 
-echo "  ✓ Using $($PYTHON --version)"
+echo "  ✓ $($PYTHON --version) with tkinter ready"
 
-# ── 3. Create virtualenv ──────────────────────────────────────────────────────
+# ── 3. Virtualenv ─────────────────────────────────────────────────────────────
 INSTALL_DIR="$HOME/.examhelper"
 mkdir -p "$INSTALL_DIR"
 VENV="$INSTALL_DIR/venv"
 
-echo "▸ Setting up environment..."
+# Rebuild venv if Python changed
+if [ -d "$VENV" ]; then
+    VENV_PY="$VENV/bin/python"
+    if ! "$VENV_PY" -c "import tkinter" 2>/dev/null; then
+        echo "  Rebuilding venv with tkinter-enabled Python..."
+        rm -rf "$VENV"
+    fi
+fi
+
 if [ ! -d "$VENV" ]; then
-    $PYTHON -m venv "$VENV"
+    "$PYTHON" -m venv "$VENV"
 fi
 
 PY="$VENV/bin/python"
 PIP="$VENV/bin/pip"
 
-# ── 4. Install dependencies (pygame has no system deps — no tkinter needed) ──
+# ── 4. Dependencies ───────────────────────────────────────────────────────────
 echo "▸ Installing dependencies..."
 "$PIP" install --quiet --upgrade pip
-"$PIP" install --quiet google-genai Pillow pynput pygame
+"$PIP" install --quiet google-genai Pillow pynput
 echo "  ✓ Dependencies ready"
 
 # ── 5. Download app.py ────────────────────────────────────────────────────────
@@ -64,7 +67,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/app.p
     -o "$INSTALL_DIR/app.py"
 echo "  ✓ App ready"
 
-# ── 6. Clear SEB prefs + download & open SEB config ──────────────────────────
+# ── 6. SEB config ─────────────────────────────────────────────────────────────
 echo "▸ Applying SEB config..."
 defaults delete org.safeexambrowser.SafeExamBrowser 2>/dev/null || true
 
@@ -93,7 +96,7 @@ PYEOF
 # ── 7. Launch ─────────────────────────────────────────────────────────────────
 echo ""
 echo "  ┌─────────────────────────────────────────┐"
-echo "  │  If keys don't work first time:         │"
+echo "  │  First run: grant Accessibility access  │"
 echo "  │  System Settings → Privacy & Security   │"
 echo "  │  → Accessibility → add Terminal         │"
 echo "  └─────────────────────────────────────────┘"
