@@ -12,15 +12,14 @@ from google.genai import types
 GEMINI_API_KEY = "AIzaSyBxSp8TBKcfvSN9OJ3uHdpMlQ8QQA2lpjs"
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ── State shared between threads ──────────────────────────────────────────────
 state = {
     "is_loading": False,
     "is_hidden": False,
 }
 
-# ── AI capture (runs in background thread) ────────────────────────────────────
+# ── AI capture ────────────────────────────────────────────────────────────────
 def capture_and_ask(update_fn, show_fn):
-    time.sleep(0.25)  # wait for window to hide
+    time.sleep(0.25)
     try:
         screenshot = ImageGrab.grab()
         buf = io.BytesIO()
@@ -49,7 +48,7 @@ def capture_and_ask(update_fn, show_fn):
             show_fn()
 
 
-# ── UI using tkinter from the correct Python ──────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 def run_ui():
     import tkinter as tk
 
@@ -77,29 +76,30 @@ def run_ui():
                           fg="#888888", bg="#1a1a2e")
     status_lbl.pack(pady=(0, 6))
 
-    # Drag
+    # ── Drag ──────────────────────────────────────────────────────────────────
     drag = {"x": 0, "y": 0}
-    def on_press(e):  drag["x"], drag["y"] = e.x, e.y
+    def on_press(e):
+        drag["x"], drag["y"] = e.x, e.y
     def on_drag(e):
         root.geometry(f"+{root.winfo_x()+e.x-drag['x']}+{root.winfo_y()+e.y-drag['y']}")
     for w in (frame, answer_lbl, status_lbl):
         w.bind("<ButtonPress-1>", on_press)
         w.bind("<B1-Motion>", on_drag)
 
-    COLORS = {"A":"#ff6b6b","B":"#ffd93d","C":"#6bcb77","D":"#4d96ff",
-              "!":"#ff4444","?":"#00ff88",".":"#ffffff"}
+    COLORS = {
+        "A": "#ff6b6b", "B": "#ffd93d", "C": "#6bcb77", "D": "#4d96ff",
+        "!": "#ff4444", "?": "#00ff88", ".": "#ffffff"
+    }
 
     def update_ui(letter, status, mode):
         answer_lbl.config(text=letter, fg=COLORS.get(letter, "#00ff88"))
-        status_lbl.config(
-            text=status,
-            fg="#888888" if mode == "ok" else "#ff4444"
-        )
+        status_lbl.config(text=status,
+                          fg="#888888" if mode == "ok" else "#ff4444")
 
     def show_win():
         root.after(0, root.deiconify)
 
-    def trigger():
+    def trigger(event=None):
         if state["is_loading"]:
             return
         state["is_loading"] = True
@@ -112,7 +112,7 @@ def run_ui():
             daemon=True
         ).start()
 
-    def toggle():
+    def toggle(event=None):
         if state["is_hidden"]:
             state["is_hidden"] = False
             root.deiconify()
@@ -120,12 +120,21 @@ def run_ui():
             state["is_hidden"] = True
             root.withdraw()
 
-    def quit_app():
+    def quit_app(event=None):
         root.destroy()
         sys.exit(0)
 
-    # Hotkeys via pynput
-    def start_hotkeys():
+    # ── Hotkeys: bind to tkinter window (works without Accessibility perms) ───
+    # These fire when the overlay window has focus
+    root.bind("<Shift-a>", trigger)
+    root.bind("<Shift-A>", trigger)
+    root.bind("<Shift-z>", toggle)
+    root.bind("<Shift-Z>", toggle)
+    root.bind("<F10>", quit_app)
+
+    # ── Global hotkeys via pynput (optional, needs Accessibility permission) ──
+    # Wrapped in a subprocess so a crash there won't kill the main UI
+    def start_global_hotkeys():
         try:
             from pynput import keyboard as K
             pressed = set()
@@ -148,13 +157,24 @@ def run_ui():
                 if key == K.Key.f10:
                     root.after(0, quit_app)
 
-            with K.Listener(on_press=on_press_key, on_release=on_release_key) as l:
-                l.join()
-        except Exception as e:
-            root.after(0, lambda: status_lbl.config(text="No hotkey", fg="#ff4444"))
+            with K.Listener(on_press=on_press_key, on_release=on_release_key) as listener:
+                listener.join()
+        except Exception:
+            # pynput failed (no Accessibility permission) — tkinter bindings still work
+            root.after(0, lambda: status_lbl.config(
+                text="Click+Shift+A", fg="#ffaa00"
+            ))
 
-    threading.Thread(target=start_hotkeys, daemon=True).start()
+    threading.Thread(target=start_global_hotkeys, daemon=True).start()
 
+    # Keep window focused so tkinter hotkeys always work
+    def keep_focus():
+        if not state["is_hidden"]:
+            root.lift()
+            root.focus_force()
+        root.after(2000, keep_focus)
+
+    root.after(500, keep_focus)
     root.mainloop()
 
 
