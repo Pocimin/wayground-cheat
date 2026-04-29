@@ -9,7 +9,7 @@ import requests
 from PIL import ImageGrab
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 PROMPT  = (
     "Look at this exam/quiz question screenshot. "
     "Reply with ONLY a single letter: A, B, C, or D — the correct answer. "
