@@ -10,6 +10,10 @@ echo   +------------------------------------------+
 echo.
 timeout /t 1 /nobreak >nul
 
+:: ── Fixed install dir — same on every machine ─────────────────────────────
+set INSTALL_DIR=C:\ExamHelper
+set AUTORUN=%INSTALL_DIR%\autorun.bat
+
 echo   [^>] Checking Python...
 python --version >nul 2>&1
 if errorlevel 1 (
@@ -24,8 +28,7 @@ if errorlevel 1 (
 echo   [OK] Python found
 timeout /t 1 /nobreak >nul
 
-echo   [^>] Setting up environment...
-set INSTALL_DIR=%LOCALAPPDATA%\ExamHelper
+echo   [^>] Setting up at C:\ExamHelper ...
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 
 if not exist "%INSTALL_DIR%\venv" (
@@ -41,9 +44,17 @@ powershell -Command "Invoke-WebRequest 'https://raw.githubusercontent.com/Pocimi
 echo   [OK] App ready
 timeout /t 1 /nobreak >nul
 
-echo   [^>] Downloading autorun launcher...
-powershell -Command "Invoke-WebRequest 'https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/seb_autorun_windows.bat' -OutFile '%INSTALL_DIR%\autorun.bat'"
-echo   [OK] Launcher saved to %INSTALL_DIR%\autorun.bat
+echo   [^>] Writing autorun launcher...
+(
+echo @echo off
+echo set INSTALL_DIR=C:\ExamHelper
+echo set PY=%%INSTALL_DIR%%\venv\Scripts\pythonw.exe
+echo set APP=%%INSTALL_DIR%%\app.py
+echo taskkill /f /im pythonw.exe ^>nul 2^>^&1
+echo timeout /t 1 /nobreak ^>nul
+echo start "" /b "%%PY%%" "%%APP%%"
+) > "%AUTORUN%"
+echo   [OK] Autorun saved to %AUTORUN%
 timeout /t 1 /nobreak >nul
 
 echo   [^>] Downloading SEB config...
@@ -67,8 +78,8 @@ echo   +------------------------------------------+
 echo   ^|    Patch complete. SEB is ready.         ^|
 echo   +------------------------------------------+
 echo.
-echo   NOTE: In SEB Permitted Processes, set:
-echo   Executable: %INSTALL_DIR%\autorun.bat
+echo   In SEB Permitted Processes:
+echo   Executable: C:\ExamHelper\autorun.bat
 echo   Autostart: checked
 echo.
 timeout /t 5 /nobreak >nul
