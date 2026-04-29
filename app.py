@@ -26,17 +26,26 @@ state = {
 
 # ── AI capture ────────────────────────────────────────────────────────────────
 def capture_and_ask(update_fn, show_fn):
-    time.sleep(0.25)
+    time.sleep(0.15)  # just enough for window to hide
     try:
         screenshot = ImageGrab.grab()
+
+        # ── Resize to max 1280px wide before encoding — massively cuts upload time
+        max_w = 1280
+        if screenshot.width > max_w:
+            ratio = max_w / screenshot.width
+            new_h = int(screenshot.height * ratio)
+            screenshot = screenshot.resize((max_w, new_h), 1)  # 1 = LANCZOS
+
         buf = io.BytesIO()
-        screenshot.save(buf, format="PNG")
+        # JPEG is 5-10x smaller than PNG — much faster to upload
+        screenshot.save(buf, format="JPEG", quality=82, optimize=True)
         img_b64 = base64.b64encode(buf.getvalue()).decode()
 
         payload = {
             "contents": [{
                 "parts": [
-                    {"inline_data": {"mime_type": "image/png", "data": img_b64}},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
                     {"text": PROMPT}
                 ]
             }]
