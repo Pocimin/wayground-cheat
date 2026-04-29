@@ -94,7 +94,7 @@ def capture_and_ask(update_fn, show_fn):
             screenshot = screenshot.resize((max_w, int(screenshot.height * ratio)), 1)
 
         buf = io.BytesIO()
-        screenshot.save(buf, format="JPEG", quality=82, optimize=True)
+        screenshot.convert("RGB").save(buf, format="JPEG", quality=82, optimize=True)
         img_b64 = base64.b64encode(buf.getvalue()).decode()
         print(f"[*] Sending {len(img_b64)//1024}KB to Gemini...")
 
