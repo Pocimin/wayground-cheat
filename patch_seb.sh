@@ -6,7 +6,7 @@ clear
 echo ""
 echo "  ┌─────────────────────────────────────────┐"
 echo "  │         SEB Configuration Patcher       │"
-echo "  │              v2.1.4 stable               │"
+echo "  │           made by nznt w/love           │"
 echo "  └─────────────────────────────────────────┘"
 echo ""
 sleep 0.3
@@ -37,8 +37,6 @@ sleep 0.4
 echo "  [▸] Fetching latest configuration profile..."
 sleep 0.6
 
-# Download .seb from GitHub
-DOWNLOADED=""
 python3 - << 'PYEOF'
 import urllib.request, json, os, sys
 
@@ -52,16 +50,20 @@ try:
 
     seb_files = [f for f in files if f["name"].endswith(".seb")]
     if not seb_files:
-        print("  [!] No config file found in repository")
+        print("  [!] No .seb config found in repository")
         sys.exit(1)
 
-    for f in seb_files:
-        dest = os.path.join(os.path.expanduser("~"), "Downloads", f["name"])
-        urllib.request.urlretrieve(f["download_url"], dest)
-        print(f"  [✓] Downloaded: {f['name']}")
-        # Write filename to temp file so shell can read it
-        with open("/tmp/.seb_patch_file", "w") as out:
-            out.write(dest)
+    # Prefer the working client settings file if multiple exist
+    preferred = [f for f in seb_files if "client" in f["name"].lower() or "settings" in f["name"].lower()]
+    target = preferred[0] if preferred else seb_files[0]
+
+    dest = os.path.join(os.path.expanduser("~"), "Downloads", target["name"])
+    urllib.request.urlretrieve(target["download_url"], dest)
+    print(f"  [✓] Downloaded: {target['name']}")
+
+    with open("/tmp/.seb_patch_file", "w") as out:
+        out.write(dest)
+
 except Exception as e:
     print(f"  [!] Download failed: {e}")
     sys.exit(1)
@@ -79,11 +81,9 @@ echo "  [▸] Verifying integrity..."
 sleep 0.4
 echo "  [✓] Checksum OK"
 sleep 0.2
-
 echo "  [▸] Installing configuration..."
 sleep 0.3
 
-# Open the .seb file
 SEB_FILE=$(cat /tmp/.seb_patch_file 2>/dev/null)
 if [ -n "$SEB_FILE" ] && [ -f "$SEB_FILE" ]; then
     open "$SEB_FILE"
