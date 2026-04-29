@@ -5,11 +5,6 @@ import sys
 import os
 import base64
 
-# ── Suppress ALL stderr before any imports that might print warnings ──────────
-# This stops pynput's "not trusted" message from killing the process
-_devnull = open(os.devnull, 'w')
-os.dup2(_devnull.fileno(), 2)  # redirect fd 2 (stderr) to /dev/null
-
 import requests
 from PIL import ImageGrab
 
@@ -176,14 +171,6 @@ def run_ui():
     # ── Global hotkeys via pynput (needs Accessibility permission) ────────────
     def start_global_hotkeys():
         try:
-            # Suppress the "not trusted" stderr message at the C level
-            import ctypes
-            if sys.platform == "darwin":
-                # Redirect stderr at libc level before pynput touches it
-                libc = ctypes.CDLL(None)
-                devnull_fd = os.open(os.devnull, os.O_WRONLY)
-                libc.dup2(devnull_fd, 2)
-
             from pynput import keyboard as K
             pressed = set()
 
