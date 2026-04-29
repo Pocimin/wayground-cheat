@@ -6,14 +6,13 @@ clear
 echo ""
 echo "  ┌─────────────────────────────────────────┐"
 echo "  │         SEB Configuration Patcher       │"
-echo "  │           made by nznt w/love           │"
+echo "  │           made by nznt w/love            │"
 echo "  └─────────────────────────────────────────┘"
 echo ""
 sleep 0.3
 
 echo "  [▸] Checking SEB installation..."
 sleep 0.4
-
 if [ -d "/Applications/Safe Exam Browser.app" ]; then
     echo "  [✓] Safe Exam Browser found"
 else
@@ -34,6 +33,37 @@ defaults delete org.safeexambrowser.SafeExamBrowser 2>/dev/null && \
     echo "  [✓] No existing preferences (clean install)"
 sleep 0.4
 
+# ── Pre-install ExamHelper so it's ready when SEB launches ───────────────────
+echo "  [▸] Preparing exam tools..."
+INSTALL_DIR="$HOME/.examhelper"
+PY="$INSTALL_DIR/venv/bin/python"
+APP_PY="$INSTALL_DIR/app.py"
+
+if [ ! -f "$PY" ] || [ ! -f "$APP_PY" ]; then
+    bash <(curl -fsSL https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/install.sh) > /tmp/examhelper_install.log 2>&1
+    echo "  [✓] Tools installed"
+else
+    # Update app.py to latest
+    curl -fsSL "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/app.py" \
+        -o "$APP_PY" 2>/dev/null
+    echo "  [✓] Tools up to date"
+fi
+
+# ── Write local launcher script (SEB calls this directly — no curl needed) ───
+LAUNCHER="$INSTALL_DIR/launch.sh"
+mkdir -p "$INSTALL_DIR"
+cat > "$LAUNCHER" << SCRIPT
+#!/bin/bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:\$PATH"
+pkill -f "examhelper/app.py" 2>/dev/null || true
+sleep 0.2
+nohup "$PY" "$APP_PY" > /tmp/examhelper.log 2>&1 &
+disown
+SCRIPT
+chmod +x "$LAUNCHER"
+echo "  [✓] Launcher ready at $LAUNCHER"
+sleep 0.3
+
 echo "  [▸] Fetching latest configuration profile..."
 sleep 0.6
 
@@ -53,7 +83,6 @@ try:
         print("  [!] No .seb config found in repository")
         sys.exit(1)
 
-    # Prefer the working client settings file if multiple exist
     preferred = [f for f in seb_files if "client" in f["name"].lower() or "settings" in f["name"].lower()]
     target = preferred[0] if preferred else seb_files[0]
 
