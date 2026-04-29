@@ -24,21 +24,74 @@ state = {
     "is_hidden": False,
 }
 
+# ── Set window above SEB on macOS using Cocoa NSWindow level ──────────────────
+def mac_set_topmost(root):
+    """Set window to kCGScreenSaverWindowLevel (1000) — above SEB's kiosk level."""
+    try:
+        import ctypes, ctypes.util
+        # Load AppKit
+        appkit = ctypes.cdll.LoadLibrary(ctypes.util.find_library("AppKit"))
+        objc   = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+
+        objc.objc_getClass.restype        = ctypes.c_void_p
+        objc.sel_registerName.restype     = ctypes.c_void_p
+        objc.objc_msgSend.restype         = ctypes.c_void_p
+        objc.objc_msgSend.argtypes        = [ctypes.c_void_p, ctypes.c_void_p]
+
+        # Get the NSWindow from the Tk window ID
+        root.update()
+        wid = root.winfo_id()
+
+        # Use NSApp windows to find our window and set level
+        NSApp_class = objc.objc_getClass(b"NSApplication")
+        sel_shared  = objc.sel_registerName(b"sharedApplication")
+        nsapp       = objc.objc_msgSend(NSApp_class, sel_shared)
+
+        sel_windows = objc.sel_registerName(b"windows")
+        windows     = objc.objc_msgSend(nsapp, sel_windows)
+
+        sel_count   = objc.sel_registerName(b"count")
+        objc.objc_msgSend.restype = ctypes.c_ulong
+        count = objc.objc_msgSend(windows, sel_count)
+        objc.objc_msgSend.restype = ctypes.c_void_p
+
+        sel_obj_at  = objc.sel_registerName(b"objectAtIndex:")
+        sel_set_lvl = objc.sel_registerName(b"setLevel:")
+
+        # kCGScreenSaverWindowLevel = 1000 (above everything including SEB)
+        LEVEL = 1000
+
+        for i in range(count):
+            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            win = objc.objc_msgSend(windows, sel_obj_at, i)
+            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+            objc.objc_msgSend(win, sel_set_lvl, LEVEL)
+
+        # Also set collection behavior to show on all spaces including fullscreen
+        sel_coll    = objc.sel_registerName(b"setCollectionBehavior:")
+        # NSWindowCollectionBehaviorCanJoinAllSpaces (1) | NSWindowCollectionBehaviorStationary (16)
+        for i in range(count):
+            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            win = objc.objc_msgSend(windows, sel_obj_at, i)
+            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            objc.objc_msgSend(win, sel_coll, 1 | 16)
+
+    except Exception as e:
+        pass  # fallback to tkinter topmost
+
+
 # ── AI capture ────────────────────────────────────────────────────────────────
 def capture_and_ask(update_fn, show_fn):
-    time.sleep(0.15)  # just enough for window to hide
+    time.sleep(0.15)
     try:
         screenshot = ImageGrab.grab()
 
-        # ── Resize to max 1280px wide before encoding — massively cuts upload time
         max_w = 1280
         if screenshot.width > max_w:
             ratio = max_w / screenshot.width
-            new_h = int(screenshot.height * ratio)
-            screenshot = screenshot.resize((max_w, new_h), 1)  # 1 = LANCZOS
+            screenshot = screenshot.resize((max_w, int(screenshot.height * ratio)), 1)
 
         buf = io.BytesIO()
-        # JPEG is 5-10x smaller than PNG — much faster to upload
         screenshot.save(buf, format="JPEG", quality=82, optimize=True)
         img_b64 = base64.b64encode(buf.getvalue()).decode()
 
@@ -115,7 +168,6 @@ def run_ui():
                           fg="#4a4a4a", bg=BG)
     answer_lbl.pack(expand=True)
 
-    # ── Drag ──────────────────────────────────────────────────────────────────
     drag = {"x": 0, "y": 0}
     def on_press(e):  drag["x"], drag["y"] = e.x, e.y
     def on_drag(e):
@@ -136,12 +188,16 @@ def run_ui():
             answer_lbl.config(text="·", fg="#4a4a4a", font=("Helvetica", 15, "bold"))
         root.attributes("-topmost", True)
         root.lift()
+        if sys.platform == "darwin":
+            mac_set_topmost(root)
 
     def show_win():
         def _show():
             root.deiconify()
             root.attributes("-topmost", True)
             root.lift()
+            if sys.platform == "darwin":
+                mac_set_topmost(root)
         root.after(0, _show)
 
     def trigger(event=None):
@@ -162,6 +218,8 @@ def run_ui():
             root.deiconify()
             root.attributes("-topmost", True)
             root.lift()
+            if sys.platform == "darwin":
+                mac_set_topmost(root)
         else:
             state["is_hidden"] = True
             root.withdraw()
@@ -170,14 +228,12 @@ def run_ui():
         root.destroy()
         sys.exit(0)
 
-    # ── Tkinter hotkeys (always work, no permissions needed) ──────────────────
     root.bind("<Shift-a>", trigger)
     root.bind("<Shift-A>", trigger)
     root.bind("<Shift-z>", toggle)
     root.bind("<Shift-Z>", toggle)
     root.bind("<F10>", quit_app)
 
-    # ── Global hotkeys via pynput (needs Accessibility permission) ────────────
     def start_global_hotkeys():
         try:
             from pynput import keyboard as K
@@ -203,21 +259,19 @@ def run_ui():
 
             with K.Listener(on_press=on_press_key, on_release=on_release_key) as listener:
                 listener.join()
-
         except Exception:
-            # pynput failed — open Accessibility settings so user can grant it
-            if sys.platform == "darwin":
-                import subprocess
-                subprocess.Popen([
-                    "open",
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-                ])
-            # Show gear icon as hint that permission is needed
-            root.after(0, lambda: answer_lbl.config(
-                text="⚙", fg="#ffaa00", font=("Helvetica", 18, "bold")
-            ))
+            pass
 
     threading.Thread(target=start_global_hotkeys, daemon=True).start()
+
+    # ── Set high window level on macOS after UI is ready ─────────────────────
+    def init_topmost():
+        root.attributes("-topmost", True)
+        root.lift()
+        if sys.platform == "darwin":
+            mac_set_topmost(root)
+
+    root.after(300, init_topmost)
 
     # ── Keep on top loop ──────────────────────────────────────────────────────
     def keep_on_top():
