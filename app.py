@@ -25,7 +25,7 @@ state = {
 }
 
 # ── Set window above SEB on macOS using Cocoa NSWindow level ──────────────────
-def mac_set_topmost(root):
+def mac_set_topmZZost(root):
     """Set window to kCGScreenSaverWindowLevel (1000) — above SEB's kiosk level."""
     try:
         import ctypes, ctypes.util
@@ -155,9 +155,18 @@ def run_ui():
     if sys.platform == "win32":
         try:
             import ctypes
+            # Hide from taskbar: set WS_EX_TOOLWINDOW, remove WS_EX_APPWINDOW
             root.update()
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            GWL_EXSTYLE    = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW  = 0x00040000
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            # Also set always on top
+            HWND_TOPMOST = -1
+            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, 0x0002 | 0x0001)
         except Exception:
             pass
 
