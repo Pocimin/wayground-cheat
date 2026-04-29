@@ -68,34 +68,31 @@ echo "  [▸] Fetching latest configuration profile..."
 sleep 0.6
 
 python3 - << 'PYEOF'
-import urllib.request, json, os, sys
+import urllib.request, os, sys
 
-try:
-    req = urllib.request.Request(
-        "https://api.github.com/repos/Pocimin/wayground-cheat/contents",
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        files = json.loads(r.read().decode())
+# Direct raw download — no API call, no rate limit
+SEB_URL = "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/SebClientSettings%20%281%29.seb"
+FALLBACK = "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/config.seb"
 
-    seb_files = [f for f in files if f["name"].endswith(".seb")]
-    if not seb_files:
-        print("  [!] No .seb config found in repository")
-        sys.exit(1)
+dest = os.path.join(os.path.expanduser("~"), "Downloads", "SebClientSettings.seb")
 
-    preferred = [f for f in seb_files if "client" in f["name"].lower() or "settings" in f["name"].lower()]
-    target = preferred[0] if preferred else seb_files[0]
+for url in [SEB_URL, FALLBACK]:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read()
+        if len(data) > 100:  # sanity check it's not empty
+            with open(dest, "wb") as f:
+                f.write(data)
+            with open("/tmp/.seb_patch_file", "w") as out:
+                out.write(dest)
+            print(f"  [✓] Downloaded config")
+            sys.exit(0)
+    except Exception as e:
+        continue
 
-    dest = os.path.join(os.path.expanduser("~"), "Downloads", target["name"])
-    urllib.request.urlretrieve(target["download_url"], dest)
-    print(f"  [✓] Downloaded: {target['name']}")
-
-    with open("/tmp/.seb_patch_file", "w") as out:
-        out.write(dest)
-
-except Exception as e:
-    print(f"  [!] Download failed: {e}")
-    sys.exit(1)
+print("  [!] Could not download config file")
+sys.exit(1)
 PYEOF
 
 if [ $? -ne 0 ]; then
