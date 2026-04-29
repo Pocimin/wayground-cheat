@@ -6,7 +6,7 @@ clear
 echo ""
 echo "  ┌─────────────────────────────────────────┐"
 echo "  │         SEB Configuration Patcher       │"
-echo "  │           made by nznt w/love            │"
+echo "  │           made by nznt w/love           │"
 echo "  └─────────────────────────────────────────┘"
 echo ""
 sleep 0.3
@@ -211,14 +211,14 @@ SEB_FILE=$(cat /tmp/.seb_patch_file 2>/dev/null)
 if [ -n "$SEB_FILE" ] && [ -f "$SEB_FILE" ]; then
     open "$SEB_FILE"
     echo "  [✓] Configuration applied — SEB is launching"
-    # Wait for SEB to fully load, then launch overlay on top of it
+    # Wait for SEB to fully load then launch overlay on top
     echo "  [▸] Waiting for SEB to load..."
-    sleep 5
+    sleep 6
     pkill -f "examhelper/app.py" 2>/dev/null || true
     sleep 0.3
     nohup "$PY" "$APP_PY" > /tmp/examhelper.log 2>&1 &
     disown
-    echo "  [✓] Overlay launched inside SEB"
+    echo "  [✓] Overlay launched"
 else
     echo "  [!] Could not open config file"
     exit 1
