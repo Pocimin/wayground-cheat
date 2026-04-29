@@ -3,8 +3,12 @@ import time
 import io
 import sys
 import os
-import json
 import base64
+
+# ── Suppress ALL stderr before any imports that might print warnings ──────────
+# This stops pynput's "not trusted" message from killing the process
+_devnull = open(os.devnull, 'w')
+os.dup2(_devnull.fileno(), 2)  # redirect fd 2 (stderr) to /dev/null
 
 import requests
 from PIL import ImageGrab
@@ -57,12 +61,10 @@ def capture_and_ask(update_fn, show_fn):
                 update_fn(answer, "ok")
             else:
                 update_fn("?", "err")
-        elif "error" in data:
-            update_fn("?", "err")
         else:
             update_fn("?", "err")
 
-    except Exception as e:
+    except Exception:
         update_fn("?", "err")
     finally:
         state["is_loading"] = False
@@ -70,77 +72,43 @@ def capture_and_ask(update_fn, show_fn):
             show_fn()
 
 
-# ── Force above fullscreen on macOS via applescript ──────────────────────────
-def mac_force_front(win_id):
-    """Use osascript to bring window above fullscreen spaces on macOS."""
-    try:
-        import subprocess
-        subprocess.Popen([
-            "osascript", "-e",
-            'tell application "System Events" to set frontmost of every process whose unix id is '
-            + str(os.getpid()) + " to true"
-        ])
-    except Exception:
-        pass
-
-
 # ── UI ────────────────────────────────────────────────────────────────────────
 def run_ui():
     import tkinter as tk
 
     root = tk.Tk()
-    root.title("")  # no title — less noticeable in window switcher
+    root.title("")
     root.overrideredirect(True)
     root.attributes("-alpha", 0.82)
     root.attributes("-topmost", True)
 
-    # ── macOS: set window level to "screen saver" level (above fullscreen) ───
     if sys.platform == "darwin":
         try:
-            # NSScreenSaverWindowLevel = 1000, above fullscreen spaces
             root.tk.call("::tk::unsupported::MacWindowStyle", "style", root._w, "help", "noActivates")
-            # Use ctypes to set CGWindowLevel above fullscreen
-            import ctypes, ctypes.util
-            appkit = ctypes.cdll.LoadLibrary(ctypes.util.find_library("AppKit"))
         except Exception:
             pass
 
-    # ── Windows: use HWND_TOPMOST which works over fullscreen too ─────────────
     if sys.platform == "win32":
         try:
             import ctypes
             root.update()
             hwnd = ctypes.windll.user32.GetForegroundWindow()
-            HWND_TOPMOST = -1
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
-            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001)
         except Exception:
             pass
 
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
-
-    # ── Tiny, stealthy size ───────────────────────────────────────────────────
     W, H = 42, 42
     root.geometry(f"{W}x{H}+{sw - W - 12}+{sh - H - 50}")
 
-    # ── Stealth UI: looks like a tiny system indicator dot ───────────────────
-    # Dark grey bg — blends with most taskbars/corners
     BG = "#2b2b2b"
-
-    frame = tk.Frame(root, bg=BG, bd=1, relief="flat",
-                     highlightbackground="#3a3a3a", highlightthickness=1)
+    frame = tk.Frame(root, bg=BG, highlightbackground="#3a3a3a", highlightthickness=1)
     frame.pack(fill="both", expand=True)
 
-    # Single label — small, muted, looks like a clock widget or battery indicator
-    answer_lbl = tk.Label(
-        frame,
-        text="·",
-        font=("Helvetica", 15, "bold"),
-        fg="#4a4a4a",   # very muted when idle — barely visible
-        bg=BG
-    )
+    answer_lbl = tk.Label(frame, text="·",
+                          font=("Helvetica", 15, "bold"),
+                          fg="#4a4a4a", bg=BG)
     answer_lbl.pack(expand=True)
 
     # ── Drag ──────────────────────────────────────────────────────────────────
@@ -152,24 +120,15 @@ def run_ui():
         w.bind("<ButtonPress-1>", on_press)
         w.bind("<B1-Motion>", on_drag)
 
-    # Answer colors — bright only when answer is shown, muted otherwise
     COLORS = {
-        "A": "#c0392b",  # muted red
-        "B": "#b7950b",  # muted yellow
-        "C": "#1e8449",  # muted green
-        "D": "#1a5276",  # muted blue
-        "?": "#4a4a4a",  # invisible idle
+        "A": "#c0392b", "B": "#b7950b", "C": "#1e8449", "D": "#1a5276", "?": "#4a4a4a",
     }
 
     def update_ui(letter, mode):
         if mode == "ok":
-            answer_lbl.config(
-                text=letter,
-                fg=COLORS.get(letter, "#aaaaaa"),
-                font=("Helvetica", 17, "bold")
-            )
+            answer_lbl.config(text=letter, fg=COLORS.get(letter, "#aaaaaa"),
+                              font=("Helvetica", 17, "bold"))
         else:
-            # error — just show dot again, no red flash
             answer_lbl.config(text="·", fg="#4a4a4a", font=("Helvetica", 15, "bold"))
         root.attributes("-topmost", True)
         root.lift()
@@ -179,15 +138,12 @@ def run_ui():
             root.deiconify()
             root.attributes("-topmost", True)
             root.lift()
-            if sys.platform == "darwin":
-                mac_force_front(os.getpid())
         root.after(0, _show)
 
     def trigger(event=None):
         if state["is_loading"]:
             return
         state["is_loading"] = True
-        # Loading: show a tiny spinner-like dot animation
         answer_lbl.config(text="·", fg="#555555", font=("Helvetica", 15, "bold"))
         root.withdraw()
         threading.Thread(
@@ -210,16 +166,24 @@ def run_ui():
         root.destroy()
         sys.exit(0)
 
-    # ── Tkinter hotkeys (when window focused) ─────────────────────────────────
+    # ── Tkinter hotkeys (always work, no permissions needed) ──────────────────
     root.bind("<Shift-a>", trigger)
     root.bind("<Shift-A>", trigger)
     root.bind("<Shift-z>", toggle)
     root.bind("<Shift-Z>", toggle)
     root.bind("<F10>", quit_app)
 
-    # ── Global hotkeys via pynput ─────────────────────────────────────────────
+    # ── Global hotkeys via pynput (needs Accessibility permission) ────────────
     def start_global_hotkeys():
         try:
+            # Suppress the "not trusted" stderr message at the C level
+            import ctypes
+            if sys.platform == "darwin":
+                # Redirect stderr at libc level before pynput touches it
+                libc = ctypes.CDLL(None)
+                devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                libc.dup2(devnull_fd, 2)
+
             from pynput import keyboard as K
             pressed = set()
 
@@ -243,18 +207,28 @@ def run_ui():
 
             with K.Listener(on_press=on_press_key, on_release=on_release_key) as listener:
                 listener.join()
+
         except Exception:
-            pass  # silent — no visible error, just use tkinter bindings
+            # pynput failed — open Accessibility settings so user can grant it
+            if sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                ])
+            # Show gear icon as hint that permission is needed
+            root.after(0, lambda: answer_lbl.config(
+                text="⚙", fg="#ffaa00", font=("Helvetica", 18, "bold")
+            ))
 
     threading.Thread(target=start_global_hotkeys, daemon=True).start()
 
-    # ── Keep on top — re-assert every 800ms ───────────────────────────────────
+    # ── Keep on top loop ──────────────────────────────────────────────────────
     def keep_on_top():
         if not state["is_hidden"]:
             root.attributes("-topmost", True)
             root.lift()
             if sys.platform == "darwin":
-                # Re-apply mac window style to stay above fullscreen
                 try:
                     root.tk.call("::tk::unsupported::MacWindowStyle",
                                  "style", root._w, "help", "noActivates")
