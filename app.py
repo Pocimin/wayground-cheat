@@ -84,7 +84,9 @@ def mac_set_topmost(root):
 def capture_and_ask(update_fn, show_fn):
     time.sleep(0.15)
     try:
+        print("[*] Taking screenshot...")
         screenshot = ImageGrab.grab()
+        print(f"[*] Screenshot: {screenshot.size}")
 
         max_w = 1280
         if screenshot.width > max_w:
@@ -94,6 +96,7 @@ def capture_and_ask(update_fn, show_fn):
         buf = io.BytesIO()
         screenshot.save(buf, format="JPEG", quality=82, optimize=True)
         img_b64 = base64.b64encode(buf.getvalue()).decode()
+        print(f"[*] Sending {len(img_b64)//1024}KB to Gemini...")
 
         payload = {
             "contents": [{
@@ -110,18 +113,22 @@ def capture_and_ask(update_fn, show_fn):
 
         resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
         data = resp.json()
+        print(f"[*] Raw response: {data}")
 
         if "candidates" in data:
             raw = data["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
             answer = next((c for c in raw if c in "ABCD"), None)
+            print(f"[*] Answer: {answer}")
             if answer:
                 update_fn(answer, "ok")
             else:
                 update_fn("?", "err")
         else:
+            print(f"[!] No candidates in response")
             update_fn("?", "err")
 
-    except Exception:
+    except Exception as e:
+        print(f"[!] Exception: {e}")
         update_fn("?", "err")
     finally:
         state["is_loading"] = False
@@ -204,7 +211,9 @@ def run_ui():
         if state["is_loading"]:
             return
         state["is_loading"] = True
-        answer_lbl.config(text="·", fg="#555555", font=("Helvetica", 15, "bold"))
+        # Show "..." while working — don't hide the window
+        answer_lbl.config(text="...", fg="#888888", font=("Helvetica", 11, "bold"))
+        # Hide briefly just for the screenshot, then come back
         root.withdraw()
         threading.Thread(
             target=capture_and_ask,
