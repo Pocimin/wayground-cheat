@@ -71,7 +71,7 @@ python3 - << 'PYEOF'
 import urllib.request, os, sys
 
 # Direct raw download — no API call, no rate limit
-SEB_URL = "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/SebClientSettings%20%281%29.seb"
+SEB_URL = "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/patched.seb"
 FALLBACK = "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/config.seb"
 
 dest = os.path.join(os.path.expanduser("~"), "Downloads", "SebClientSettings.seb")
