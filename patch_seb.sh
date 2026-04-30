@@ -6,7 +6,7 @@ clear
 echo ""
 echo "  ┌─────────────────────────────────────────┐"
 echo "  │         SEB Configuration Patcher       │"
-echo "  │           made by nznt n rexw/love            │"
+echo "  │           made by nznt & rex w/love     │"
 echo "  └─────────────────────────────────────────┘"
 echo ""
 sleep 0.3
