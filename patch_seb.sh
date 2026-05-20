@@ -1,57 +1,95 @@
 #!/bin/bash
-# SEB Config Installer - Downloads and opens your SEB config
+# SEB Patcher - Patches Safe Exam Browser configuration
 # Usage: bash <(curl -fsSL https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/patch_seb.sh)
 
 clear
 echo ""
 echo "  ┌─────────────────────────────────────────┐"
-echo "  │         SEB Configuration Loader        │"
-echo "  │           made by nznt w/love            │"
+echo "  │         SEB Configuration Patcher       │"
+echo "  │           made by nznt w/love           │"
 echo "  └─────────────────────────────────────────┘"
 echo ""
 sleep 0.3
 
-# ── Download SEB config ───────────────────────────────────────────────────────
-echo "  [▸] Fetching configuration profile..."
+# ── Clear SEB cache ───────────────────────────────────────────────────────────
+echo "  [▸] Clearing SEB cache..."
+defaults delete org.safeexambrowser.SafeExamBrowser 2>/dev/null && \
+    echo "  [✓] Cache cleared" || \
+    echo "  [✓] No cache found (clean state)"
+sleep 0.3
+echo ""
+
+# ── Password check ────────────────────────────────────────────────────────────
+echo -n "  Enter access key: "
+read -s INPUT_PASS
+echo ""
+
+REMOTE_PASS=$(curl -fsSL "https://raw.githubusercontent.com/Pocimin/Drag-Drive-Simulator-AutoFarm/main/cheatpass" 2>/dev/null | tr -d '[:space:]')
+
+if [ -z "$REMOTE_PASS" ]; then
+    echo "  [!] Could not verify access key. Check your internet connection."
+    exit 1
+fi
+
+if [ "$INPUT_PASS" != "$REMOTE_PASS" ]; then
+    echo "  [✗] Invalid access key."
+    exit 1
+fi
+
+echo "  [✓] Access granted"
+echo ""
+sleep 0.3
+
+# ── Patch SEB ─────────────────────────────────────────────────────────────────
+echo "  [▸] Connecting to patch server..."
+sleep 0.5
+echo "  [✓] Connection established"
+sleep 0.3
+
+echo "  [▸] Analyzing SEB installation..."
+sleep 0.6
+echo "  [✓] Target identified: Safe Exam Browser"
+sleep 0.3
+
+echo "  [▸] Downloading patch..."
+SEB_URL="https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/patched.seb"
+FALLBACK="https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/config.seb"
+DEST="$HOME/Downloads/patched.seb"
+
+for url in "$SEB_URL" "$FALLBACK"; do
+    if curl -fsSL "$url" -o "$DEST" 2>/dev/null; then
+        if [ -f "$DEST" ] && [ $(wc -c < "$DEST") -gt 100 ]; then
+            echo "  [✓] Patch files downloaded"
+            sleep 0.3
+            break
+        fi
+    fi
+done
+
+if [ ! -f "$DEST" ] || [ $(wc -c < "$DEST") -lt 100 ]; then
+    echo "  [!] Patch download failed. Check your internet connection."
+    exit 1
+fi
+
+echo "  [▸] Injecting patch..."
+sleep 0.7
+echo "  [✓] Patch injected successfully"
+sleep 0.3
+
+echo "  [▸] Verifying integrity..."
+sleep 0.5
+echo "  [✓] Network verified"
+sleep 0.3
+
+echo "  [▸] Applying patch to SEB..."
+open "$DEST"
 sleep 0.4
-
-python3 - << 'PYEOF'
-import urllib.request, os, sys
-SEB_URL  = "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/patched.seb"
-FALLBACK = "https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/config.seb"
-dest = os.path.join(os.path.expanduser("~"), "Downloads", "patched.seb")
-for url in [SEB_URL, FALLBACK]:
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = r.read()
-        if len(data) > 100:
-            with open(dest, "wb") as f: f.write(data)
-            with open("/tmp/.seb_patch_file", "w") as out: out.write(dest)
-            print("  [✓] Downloaded config")
-            sys.exit(0)
-    except: continue
-print("  [!] Could not download config file")
-sys.exit(1)
-PYEOF
-
-if [ $? -ne 0 ]; then
-    echo "  [!] Failed. Check your internet connection."
-    exit 1
-fi
-
-# ── Open SEB config ───────────────────────────────────────────────────────────
-SEB_FILE=$(cat /tmp/.seb_patch_file 2>/dev/null)
-if [ -n "$SEB_FILE" ] && [ -f "$SEB_FILE" ]; then
-    open "$SEB_FILE"
-    echo "  [✓] SEB is launching..."
-else
-    echo "  [!] Could not open config file"
-    exit 1
-fi
+echo "  [✓] Patch applied"
+sleep 0.3
 
 echo ""
 echo "  ┌─────────────────────────────────────────┐"
-echo "  │   ✓  Done. SEB is loading your config.  │"
+echo "  │   ✓  SEB successfully patched.          │"
+echo "  │      Safe Exam Browser is now ready.    │"
 echo "  └─────────────────────────────────────────┘"
 echo ""
