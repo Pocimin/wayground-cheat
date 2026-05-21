@@ -40,6 +40,38 @@ echo "  [✓] Access granted"
 echo ""
 sleep 0.3
 
+# ── Select patch type ─────────────────────────────────────────────────────────
+echo "  Select patch type:"
+echo ""
+echo "  [1] Asesmen"
+echo "  [2] Pembelajaran"
+echo ""
+echo -n "  Enter choice (1 or 2): "
+read PATCH_CHOICE
+echo ""
+
+case "$PATCH_CHOICE" in
+    1)
+        echo "  [✓] Selected: Asesmen"
+        SEB_URL="https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/patchedaas.seb"
+        FALLBACK="https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/patchedaas.seb"
+        DEST="$HOME/Downloads/patched_asesmen.seb"
+        ;;
+    2)
+        echo "  [✓] Selected: Pembelajaran"
+        SEB_URL="https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/patched.seb"
+        FALLBACK="https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/config.seb"
+        DEST="$HOME/Downloads/patched_pembelajaran.seb"
+        ;;
+    *)
+        echo "  [✗] Invalid choice. Please enter 1 or 2."
+        exit 1
+        ;;
+esac
+
+sleep 0.3
+echo ""
+
 # ── Patch SEB ─────────────────────────────────────────────────────────────────
 echo "  [▸] Connecting to patch server..."
 sleep 0.5
@@ -52,9 +84,6 @@ echo "  [✓] Target identified: Safe Exam Browser"
 sleep 0.3
 
 echo "  [▸] Downloading patch..."
-SEB_URL="https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/patched.seb"
-FALLBACK="https://raw.githubusercontent.com/Pocimin/wayground-cheat/main/config.seb"
-DEST="$HOME/Downloads/patched.seb"
 
 for url in "$SEB_URL" "$FALLBACK"; do
     if curl -fsSL "$url" -o "$DEST" 2>/dev/null; then
