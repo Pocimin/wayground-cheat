@@ -98,6 +98,26 @@ style.textContent = `
 
 #_aw-panel._aw-visible { opacity: 1; pointer-events: all; transform: scale(1); }
 
+#_aw-answer-hint {
+
+  position: fixed; right: 20px; bottom: 20px; z-index: 999998;
+
+  max-width: min(420px, calc(100vw - 40px)); padding: 8px 12px;
+
+  color: rgba(255,255,255,.72); background: rgba(26,27,30,.62);
+
+  border: 1px solid rgba(255,255,255,.08); border-radius: 8px;
+
+  box-shadow: 0 4px 16px rgba(0,0,0,.18); backdrop-filter: blur(6px);
+
+  font: 12px ui-sans-serif, system-ui, sans-serif; line-height: 1.35;
+
+  opacity: 0; pointer-events: none; transition: opacity .18s ease;
+
+}
+
+#_aw-answer-hint._aw-visible { opacity: .78; }
+
 #_aw-status { color: #fff; font-size: 14px; font-weight: 600; margin-bottom: 10px; transition: .3s; text-align: left; word-wrap: break-word; }
 
 ._aw-row { display: flex; gap: 8px; margin-bottom: 8px; }
@@ -206,7 +226,7 @@ let outlineColor = '#000000';
 
 let answersVisible = true;
 
-let panelEl, statusEl;
+let panelEl, statusEl, answerHintEl;
 
 const tmpDiv = document.createElement("div");
 
@@ -302,6 +322,10 @@ function createPanel() {
 
   statusEl = $('#_aw-status');
 
+  answerHintEl = document.createElement('div');
+  answerHintEl.id = '_aw-answer-hint';
+  document.body.appendChild(answerHintEl);
+
   const keyInput   = $('#_aw-key-input');
 
   const keyBtn     = $('#_aw-key-btn');
@@ -376,7 +400,6 @@ function createPanel() {
 
       pinRow.style.display = 'flex';
 
-      colorRow.style.display = 'flex';
 
       statusEl.textContent = '✅ Access granted';
 
@@ -416,7 +439,7 @@ function createPanel() {
 
     try {
 
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/gi, ''));
 
       processAnswerData(parsed);
 
@@ -446,8 +469,6 @@ function createPanel() {
 
       statusEl.style.color = '#ff5555';
 
-      pasteArea.value = '';
-
       pasteArea.focus();
 
     }
@@ -456,13 +477,40 @@ function createPanel() {
 
   const handlePinLoad = async () => {
 
-    const pin = pinInput.value.trim().replace(/\s/g, '');
+    const pin = pinInput.value.trim().replace(/\D/g, '');
 
-    if (!pin) return;
+    if (![7, 8].includes(pin.length)) {
+
+      statusEl.textContent = 'Enter a 7- or 8-digit room PIN';
+      statusEl.style.color = '#ff5555';
+      return;
+
+    }
 
     
 
     const apiUrl = `https://api.cheatnetwork.eu/quizizz/${pin}/answers`;
+
+    try {
+
+      const res = await _fetch(apiUrl, { headers: { Accept: 'application/json' } });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      processAnswerData(await res.json());
+      pinRow.style.display = 'none';
+      toggleRow.style.display = 'block';
+      statusEl.textContent = 'Ready - watching for questions';
+      statusEl.style.color = '#50fa7b';
+      startObserver();
+      setTimeout(() => panelEl.classList.remove('_aw-visible'), 1500);
+      return;
+
+    } catch (err) {
+
+      console.warn('[AW] Automatic load failed; using paste fallback:', err);
+
+    }
 
     
 
@@ -588,19 +636,10 @@ window.addEventListener('keydown', e => {
 
 function findGamePin() {
 
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const text = document.body.innerText.replace(/[\u00a0\u202f]/g, ' ');
+  const matches = text.match(/\b\d{3,4}[\s-]*\d{4}\b/g) || [];
 
-  let node;
-
-  while (node = walker.nextNode()) {
-
-    const m = node.nodeValue.trim().match(/\b(\d{4})\s(\d{4})\b/);
-
-    if (m && node.parentElement?.offsetParent !== null) return m[0].replace(/\s/g, '');
-
-  }
-
-  return null;
+  return matches.map(value => value.replace(/\D/g, '')).find(pin => pin.length === 7 || pin.length === 8) || null;
 
 }
 
@@ -730,9 +769,7 @@ function getQuestion() {
 
   
 
-  if (options.length) return { qid, options };
-
-  return null;
+  return { qid, options };
 
 }
 
@@ -747,6 +784,34 @@ function clearHighlights() {
     el.style.removeProperty('outline-offset');
 
   });
+
+  answerHintEl?.classList.remove('_aw-visible');
+  if (answerHintEl) answerHintEl.textContent = '';
+
+}
+
+function showAnswerHint(q, ans) {
+
+  if (!answerHintEl) return;
+
+  const targets = typeof ans === 'string' && ans.includes('Open-ended')
+    ? ['Open-ended']
+    : Array.isArray(ans) ? ans : [ans];
+
+  const labels = targets.map(target => {
+
+    const opt = q.options.find(o => o.text === target);
+
+    return opt?.element.innerText?.replace(/\s+/g, ' ').trim() || target;
+
+  });
+
+  if (labels.length) {
+
+    answerHintEl.textContent = `Answer: ${labels.join(' • ')}`;
+    answerHintEl.classList.add('_aw-visible');
+
+  }
 
 }
 
@@ -768,11 +833,20 @@ function highlight() {
 
   const ans = cache.get(q.qid);
 
+  if (typeof ans === 'string' && ans.includes('Open-ended')) {
+
+    showAnswerHint(q, ans);
+    return;
+
+  }
+
   if (!ans || (typeof ans === 'string' && ans.startsWith('📝'))) return;
 
   
 
   const targets = Array.isArray(ans) ? ans : [ans];
+
+  showAnswerHint(q, ans);
 
   
 
@@ -789,10 +863,6 @@ function highlight() {
     if (opt) {
 
       console.log('[AW] ✅ Highlighting:', target);
-
-      opt.element.style.outline = `3px solid ${outlineColor}`;
-
-      opt.element.style.outlineOffset = '2px';
 
     }
 
