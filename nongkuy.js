@@ -479,7 +479,7 @@ function createPanel() {
 
     const pin = pinInput.value.trim().replace(/\D/g, '');
 
-    if (![7, 8].includes(pin.length)) {
+    if (![6, 7, 8].includes(pin.length)) {
 
       statusEl.textContent = 'Enter a 7- or 8-digit room PIN';
       statusEl.style.color = '#ff5555';
