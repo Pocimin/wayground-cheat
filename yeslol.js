@@ -1,2571 +1,2536 @@
 // ==UserScript==
-// @name         Hack Wayground
-// @author       Anonymous
-// @description  Hack Wayground V2 - Smart Solver & Auto Answer
-// @namespace    http://tampermonkey.net/
-// @match        https://wayground.com/*
+// @name         Wayground Quizizz Cheat: Show Answers & Block AntiCheat
+// @description  Wayground Hack injects answers into the UI and neutralizes anti-cheat telemetry; includes stealth focus protection making your activity invisible and re-enables copy, paste, and text selection; powered by AI.
+// @namespace    https://github.com/ByOscarPINE
+// @version      2.1.0
+// @author       byOscar
+// @license      GPLv3
+// @match        *://*.wayground.com/*
+// @match        *://*.quizizz.com/*
+// @icon         https://cf.quizizz.com/img/wayground/brand/favicon/favicon-32x32.ico
 // @grant        GM_xmlhttpRequest
-// @grant        unsafeWindow
-// @grant        GM_addStyle
-// @run-at       document-start
-// @icon         https://blackarch.org/images/logo/ba-logo.png
-// @version      4.6.0
-// @downloadURL  https://raw.githubusercontent.com/AtelierMizumi/wayground-tool/main/wayground-script.user.js
-// @updateURL    https://raw.githubusercontent.com/AtelierMizumi/wayground-tool/main/wayground-script.meta.js
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @connect      generativelanguage.googleapis.com
+// @connect      api.openai.com
+// @connect      api.agnes.ai
 // ==/UserScript==
 
-(function () {
+(function() {
     'use strict';
+    let API_KEY = null;
+    let QUIZ_DATA = null;
+    let ROOM_DATA = null;
+    let AI_DATA = null;
+    let OK = false;
+    let QUIZ_NAME = 'Waiting';
+    let ANTI_CHEAT = false;
+    let TYPE_QUIZ = '';
+    let CLEANED_QUESTIONS = null;
 
-    const targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    const targetDoc = targetWindow.document || document;
+    const infractions = /^https:\/\/wayground\.com\/_gameapi\/main\/public\/v1\/games\/[a-f0-9]+\/player-infraction/;
+    const rejoin = /^https:\/\/wayground\.com\/_gameapi\/main\/public\/v1\/games\/([a-f0-9]{24})\/rejoin/;
+    const join = /^https:\/\/wayground\.com\/play-api\/v5\/join/;
+    const soloJoin = /^https:\/\/wayground\.com\/play-api\/v4\/soloJoin/;
+    const base = /^https:\/\/wayground\.com\/_gameapi\/main\/public\/v1\/students\/attempts\/([a-f0-9]{24})/;
+    const checkRoom = /^https:\/\/wayground\.com\/play-api\/v5\/checkRoom/;
+    const checkRoomAsignmets = /^https:\/\/wayground\.com\/play-api\/v5\/checkAssignment/;
 
-    // ==========================================
-    // 1. ANTI-CHEAT DEFENSE & TAB-SWITCH PROTECTION
-    // Prevents Quizizz / Wayground from logging "Tab Switch" alerts to teacher
-    // ==========================================
-    try {
-        Object.defineProperty(targetDoc, 'hidden', {
-            get: () => false,
-            configurable: true
-        });
-        Object.defineProperty(targetDoc, 'visibilityState', {
-            get: () => 'visible',
-            configurable: true
-        });
-        Object.defineProperty(targetDoc, 'webkitHidden', {
-            get: () => false,
-            configurable: true
-        });
-        Object.defineProperty(targetDoc, 'webkitVisibilityState', {
-            get: () => 'visible',
-            configurable: true
-        });
-        targetDoc.hasFocus = () => true;
-    } catch (e) {}
+    // Agnes — OpenAI-compatible gateway. Same /chat/completions shape as OpenAI.
+    // Serve any quiz model; swap AGNES_MODEL if you want a different Agnes model.
+    const AGNES_BASE = 'https://api.agnes.ai/v1';
+    const AGNES_MODEL = 'agnes-flash';
 
-    // ==========================================
-    // 2. KEYBOARD PROTECTION & INPUT ISOLATION
-    // Prevents page shortcuts/traps from suppressing typing in tool inputs
-    // ==========================================
-    const isToolElement = (el) => {
-        if (!el) return false;
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
         try {
-            if (el.nodeType !== 1) el = el.parentElement;
-            if (!el) return false;
-            return !!(
-                el.id === 'key-input' ||
-                el.id === 'pin-input' ||
-                el.id === 'wg-speed-input' ||
-                el.id === 'wg-sheet-search' ||
-                el.id === 'solver-panel' ||
-                el.id === 'solver-mini-icon' ||
-                el.id === 'wg-cheatsheet-modal' ||
-                el.hasAttribute('data-wg-tool') ||
-                (el.closest && (el.closest('#solver-panel') || el.closest('#solver-mini-icon') || el.closest('#wg-cheatsheet-modal') || el.closest('[data-wg-tool]')))
-            );
+            this._url = url;
         } catch (e) {
-            return false;
+            console.warn("Could not capture request URL in XMLHttpRequest.open", e);
         }
+        return originalOpen.apply(this, arguments);
     };
 
-    const origAddEventListener = targetWindow.EventTarget.prototype.addEventListener;
-    const origRemoveEventListener = targetWindow.EventTarget.prototype.removeEventListener;
-    const listenerWrapperMap = new WeakMap();
-
-    // 2.1 Monkey-patch EventTarget.addEventListener & removeEventListener
-    try {
-        targetWindow.EventTarget.prototype.addEventListener = function (type, listener, options) {
-            // Anti-cheat tab-switch blocker: suppress visibilitychange & window blur from host page
-            if (['visibilitychange', 'webkitvisibilitychange'].includes(type)) {
-                return;
-            }
-            if (['blur', 'focusout'].includes(type) && (this === targetWindow || this === targetDoc)) {
-                return;
-            }
-
-            if (typeof listener === 'function' && ['keydown', 'keyup', 'keypress', 'beforeinput', 'input'].includes(type)) {
-                if (isToolElement(this)) {
-                    return origAddEventListener.call(this, type, listener, options);
-                }
-                let wrappedListener = listenerWrapperMap.get(listener);
-                if (!wrappedListener) {
-                    wrappedListener = function (event) {
-                        if (isToolElement(event.target) || (event.composedPath && event.composedPath().some(isToolElement))) {
-                            return; // Bypass host page key listener when inside tool
-                        }
-                        return listener.apply(this, arguments);
-                    };
-                    listenerWrapperMap.set(listener, wrappedListener);
-                }
-                return origAddEventListener.call(this, type, wrappedListener, options);
-            }
-            return origAddEventListener.call(this, type, listener, options);
-        };
-
-        targetWindow.EventTarget.prototype.removeEventListener = function (type, listener, options) {
-            if (typeof listener === 'function' && ['keydown', 'keyup', 'keypress', 'beforeinput', 'input'].includes(type)) {
-                const wrappedListener = listenerWrapperMap.get(listener) || listener;
-                return origRemoveEventListener.call(this, type, wrappedListener, options);
-            }
-            return origRemoveEventListener.call(this, type, listener, options);
-        };
-    } catch (e) {
-        console.warn('[Wayground Tool] addEventListener patch failed:', e);
-    }
-
-    // 2.2 Monkey-patch Event.prototype.preventDefault & KeyboardEvent.prototype.preventDefault
-    try {
-        const origPreventDefault = targetWindow.Event.prototype.preventDefault;
-        targetWindow.Event.prototype.preventDefault = function () {
-            if (isToolElement(this.target) || (this.composedPath && this.composedPath().some(isToolElement))) {
-                return; // Disallow suppressing native typing in tool inputs
-            }
-            return origPreventDefault.apply(this, arguments);
-        };
-        if (targetWindow.KeyboardEvent && targetWindow.KeyboardEvent.prototype && targetWindow.KeyboardEvent.prototype.hasOwnProperty('preventDefault')) {
-            const origKeyPrevent = targetWindow.KeyboardEvent.prototype.preventDefault;
-            targetWindow.KeyboardEvent.prototype.preventDefault = function () {
-                if (isToolElement(this.target) || (this.composedPath && this.composedPath().some(isToolElement))) {
-                    return;
-                }
-                return origKeyPrevent.apply(this, arguments);
-            };
-        }
-    } catch (e) {
-        console.warn('[Wayground Tool] preventDefault patch failed:', e);
-    }
-
-    // 2.3 Intercept onkeydown/onkeypress/onkeyup property setters on document & window
-    const patchInlineHandler = (obj, propName) => {
+    XMLHttpRequest.prototype.send = function (body) {
         try {
-            let internalHandler = null;
-            Object.defineProperty(obj, propName, {
-                configurable: true,
-                enumerable: true,
-                get() {
-                    return internalHandler;
-                },
-                set(fn) {
-                    if (['onvisibilitychange'].includes(propName) || (propName === 'onblur' && (obj === targetDoc || obj === targetWindow))) {
-                        internalHandler = () => {}; // Neutralize inline tab-switch anti-cheat handlers
-                        return;
-                    }
-                    if (typeof fn === 'function') {
-                        internalHandler = function (event) {
-                            if (isToolElement(event.target) || (event.composedPath && event.composedPath().some(isToolElement))) {
-                                return;
-                            }
-                            return fn.apply(this, arguments);
-                        };
-                    } else {
-                        internalHandler = fn;
-                    }
-                }
-            });
-        } catch (e) {}
-    };
-
-    ['onkeydown', 'onkeypress', 'onkeyup', 'onbeforeinput', 'oninput', 'onblur', 'onvisibilitychange'].forEach(prop => {
-        patchInlineHandler(targetDoc, prop);
-        patchInlineHandler(targetWindow, prop);
-    });
-
-    // 2.4 Capture-phase bodyguard listener on window
-    const isolationGuard = (e) => {
-        if (isToolElement(e.target) || (e.composedPath && e.composedPath().some(isToolElement))) {
-            e.stopImmediatePropagation();
-        }
-    };
-    ['keydown', 'keypress', 'keyup', 'beforeinput', 'input'].forEach(evtType => {
-        origAddEventListener.call(targetWindow, evtType, isolationGuard, true);
-    });
-
-    // ==========================================
-    // 3. STYLES & UI DESIGN
-    // ==========================================
-    const STYLES = `
-        #solver-panel {
-            position: fixed;
-            bottom: 20px;
-            left: 20px;
-            width: 290px;
-            background: rgba(15, 23, 42, 0.95);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 12px;
-            box-shadow: 0 16px 36px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.05);
-            z-index: 9999999;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            color: #f8fafc;
-            padding: 12px 14px;
-            box-sizing: border-box;
-            user-select: none;
-            touch-action: none;
-        }
-        .wg-panel-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            cursor: move;
-            padding-bottom: 8px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-            margin-bottom: 10px;
-            touch-action: none;
-        }
-        .wg-panel-title-wrap {
-            display: flex;
-            align-items: center;
-            gap: 7px;
-            font-size: 13px;
-            font-weight: 700;
-            color: #38bdf8;
-            letter-spacing: 0.3px;
-        }
-        .wg-panel-actions {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-        }
-        .wg-header-btn {
-            background: rgba(255, 255, 255, 0.08);
-            border: none;
-            color: #94a3b8;
-            border-radius: 6px;
-            width: 24px;
-            height: 24px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            font-size: 12px;
-            line-height: 1;
-            padding: 0;
-            transition: all 0.15s;
-        }
-        .wg-header-btn:hover {
-            background: rgba(255, 255, 255, 0.18);
-            color: white;
-        }
-        #solver-status {
-            font-size: 12.5px;
-            line-height: 1.4;
-            color: #e2e8f0;
-            word-break: break-word;
-            margin-bottom: 8px;
-        }
-        .wg-input-row {
-            display: flex;
-            gap: 6px;
-            margin-bottom: 6px;
-        }
-        #key-input, #pin-input {
-            flex: 1;
-            padding: 8px 10px;
-            border-radius: 6px;
-            border: 1px solid rgba(255, 255, 255, 0.18);
-            background: rgba(0, 0, 0, 0.35);
-            color: white;
-            font-size: 12px;
-            outline: none;
-            box-sizing: border-box;
-            user-select: text !important;
-            touch-action: manipulation;
-        }
-        #key-input:focus, #pin-input:focus {
-            border-color: #38bdf8;
-            box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
-        }
-        #save-key-btn, #load-btn {
-            background: #3b82f6;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            padding: 0 12px;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.15s;
-            white-space: nowrap;
-        }
-        #save-key-btn:hover, #load-btn:hover {
-            background: #2563eb;
-        }
-        .wg-key-help {
-            font-size: 11px;
-            color: #94a3b8;
-            margin-top: 4px;
-            line-height: 1.3;
-        }
-        .wg-key-help a {
-            color: #38bdf8;
-            text-decoration: none;
-        }
-        .wg-key-help a:hover {
-            text-decoration: underline;
-        }
-        .wg-settings-box {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            margin-top: 6px;
-            padding-top: 6px;
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
-            font-size: 12px;
-        }
-        .wg-checkbox-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            color: #cbd5e1;
-            cursor: pointer;
-        }
-        .wg-checkbox-row input[type="checkbox"] {
-            cursor: pointer;
-            accent-color: #38bdf8;
-            width: 15px;
-            height: 15px;
-        }
-        .wg-speed-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            color: #cbd5e1;
-        }
-        .wg-stepper-wrap {
-            display: flex;
-            align-items: center;
-            gap: 4px;
-        }
-        .wg-step-btn {
-            background: rgba(255, 255, 255, 0.1);
-            color: #e2e8f0;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 4px;
-            width: 22px;
-            height: 22px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            font-size: 13px;
-            font-weight: 700;
-            padding: 0;
-            line-height: 1;
-            transition: all 0.15s;
-        }
-        .wg-step-btn:hover {
-            background: rgba(56, 189, 248, 0.25);
-            color: #38bdf8;
-            border-color: #38bdf8;
-        }
-        .wg-number-input {
-            width: 44px;
-            padding: 2px 4px;
-            border-radius: 4px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            background: rgba(0, 0, 0, 0.3);
-            color: white;
-            font-size: 12px;
-            text-align: center;
-            outline: none;
-            user-select: text !important;
-        }
-        .wg-select-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            color: #cbd5e1;
-            margin-top: 2px;
-        }
-        .wg-select-input {
-            background: rgba(0, 0, 0, 0.4);
-            color: #e2e8f0;
-            border: 1px solid rgba(255, 255, 255, 0.18);
-            border-radius: 6px;
-            padding: 3px 6px;
-            font-size: 11px;
-            outline: none;
-            cursor: pointer;
-        }
-        .wg-select-input option {
-            background: #0f172a;
-            color: white;
-        }
-        #change-key-btn, #change-pin-btn, .wg-sheet-btn, .wg-sec-btn {
-            background: rgba(255, 255, 255, 0.06);
-            color: #94a3b8;
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 6px;
-            padding: 5px;
-            font-size: 11px;
-            cursor: pointer;
-            margin-top: 4px;
-            transition: all 0.15s;
-            text-align: center;
-            width: 100%;
-            box-sizing: border-box;
-        }
-        #change-key-btn:hover, #change-pin-btn:hover, .wg-sheet-btn:hover, .wg-sec-btn:hover {
-            background: rgba(255, 255, 255, 0.12);
-            color: #f1f5f9;
-        }
-        .wg-nav-row {
-            display: flex;
-            gap: 4px;
-            margin-top: 6px;
-        }
-        .wg-chip-btn {
-            background: rgba(255, 255, 255, 0.08);
-            color: #e2e8f0;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 6px;
-            padding: 5px 8px;
-            font-size: 11px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.15s;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            white-space: nowrap;
-        }
-        .wg-chip-btn:hover {
-            background: rgba(255, 255, 255, 0.18);
-            color: white;
-        }
-        .wg-chip-primary {
-            background: linear-gradient(135deg, #3b82f6, #6366f1) !important;
-            color: white !important;
-            border-color: rgba(99, 102, 241, 0.4) !important;
-            font-weight: 600 !important;
-        }
-        .wg-chip-primary:hover {
-            background: linear-gradient(135deg, #2563eb, #4f46e5) !important;
-        }
-        .wg-chip-active {
-            background: #ef4444 !important;
-            color: white !important;
-            border-color: #f87171 !important;
-        }
-        .wg-countdown-wrap {
-            margin: 6px 0;
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-        .wg-progress-bg {
-            width: 100%;
-            height: 4px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 2px;
-            overflow: hidden;
-        }
-        .wg-progress-bar {
-            height: 100%;
-            background: linear-gradient(90deg, #38bdf8, #818cf8);
-            width: 100%;
-            transition: width 0.1s linear;
-        }
-        .wg-live-timer-controls {
-            display: flex;
-            align-items: center;
-            gap: 4px;
-            flex-wrap: wrap;
-            margin-top: 4px;
-        }
-
-        /* Floating Mini Icon */
-        #solver-mini-icon {
-            position: fixed;
-            bottom: 20px;
-            left: 20px;
-            width: 42px;
-            height: 42px;
-            background: rgba(15, 23, 42, 0.75);
-            backdrop-filter: blur(8px);
-            border: 1px solid rgba(56, 189, 248, 0.25);
-            border-radius: 50%;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-            z-index: 9999999;
-            display: none;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            font-size: 18px;
-            color: #38bdf8;
-            opacity: 0.18;
-            touch-action: none;
-            user-select: none;
-            transition: opacity 0.25s ease, transform 0.15s ease, border-color 0.2s ease, box-shadow 0.2s ease;
-        }
-        #solver-mini-icon:hover {
-            opacity: 0.95;
-            transform: scale(1.08);
-            border-color: #38bdf8;
-            box-shadow: 0 8px 20px rgba(56, 189, 248, 0.35);
-        }
-
-        /* Cheatsheet Modal */
-        .wg-modal-overlay {
-            position: fixed;
-            top: 0; left: 0; width: 100vw; height: 100vh;
-            background: rgba(0, 0, 0, 0.65);
-            backdrop-filter: blur(4px);
-            z-index: 99999999;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 16px;
-            box-sizing: border-box;
-        }
-        .wg-modal-card {
-            background: #0f172a;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 12px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.7);
-            width: 100%;
-            max-width: 480px;
-            max-height: 80vh;
-            display: flex;
-            flex-direction: column;
-            padding: 14px;
-            box-sizing: border-box;
-            color: #f8fafc;
-            font-family: inherit;
-        }
-        .wg-modal-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding-bottom: 8px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            margin-bottom: 10px;
-        }
-        .wg-modal-title {
-            font-size: 14px; font-weight: 700; color: #38bdf8;
-        }
-        .wg-search-input {
-            background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255, 255, 255, 0.18);
-            color: white; border-radius: 6px; padding: 5px 8px; font-size: 12px;
-            margin-bottom: 8px; outline: none; box-sizing: border-box; width: 100%;
-        }
-        .wg-sheet-content {
-            overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 4px;
-            max-height: 55vh; padding-right: 2px; scrollbar-width: thin;
-        }
-        .wg-sheet-item {
-            display: flex; gap: 6px; align-items: baseline;
-            padding: 5px 7px; border-radius: 6px; background: rgba(255, 255, 255, 0.03);
-            font-size: 12px;
-        }
-        .wg-sheet-num {
-            font-weight: 700; color: #a78bfa; font-size: 11px; min-width: 24px; flex-shrink: 0;
-        }
-        .wg-sheet-ans {
-            color: #e2e8f0; word-break: break-word; line-height: 1.3;
-        }
-
-        /* Mobile & Touch Responsive Optimization */
-        @media (max-width: 600px), (pointer: coarse) {
-            #solver-panel {
-                bottom: 12px; left: 12px;
-                padding: 10px 12px;
-                max-width: calc(100vw - 24px);
-            }
-            #solver-mini-icon {
-                bottom: 12px; left: 12px;
-                width: 46px; height: 46px; font-size: 20px;
-            }
-            #key-input, #pin-input, .wg-number-input {
-                font-size: 14px;
-            }
-            #save-key-btn, #load-btn {
-                padding: 0 14px; min-height: 36px; font-size: 13px;
-            }
-            .wg-checkbox-row {
-                min-height: 30px;
-            }
-            .wg-speed-row {
-                min-height: 30px;
-            }
-            .wg-header-btn {
-                width: 28px; height: 28px; font-size: 14px;
-            }
-            .wg-chip-btn {
-                height: 28px; font-size: 11.5px;
-            }
-        }
-    `;
-
-    const applyStyles = () => {
-        if (typeof GM_addStyle !== 'undefined') {
-            try { GM_addStyle(STYLES); return; } catch(e) {}
-        }
-        const target = document.head || document.documentElement;
-        if (target) {
-            const styleEl = document.createElement('style');
-            styleEl.textContent = STYLES;
-            target.appendChild(styleEl);
-        } else {
-            document.addEventListener('DOMContentLoaded', () => {
-                const styleEl = document.createElement('style');
-                styleEl.textContent = STYLES;
-                (document.head || document.documentElement).appendChild(styleEl);
-            });
-        }
-    };
-    applyStyles();
-
-    // ==========================================
-    // 4. STORAGE & CONFIG
-    // ==========================================
-    const STORAGE_KEY = 'wayground_api_key';
-    const PIN_STORAGE_KEY = 'wayground_last_pin';
-    const CONFIG_KEY = 'wayground_tool_config';
-
-    function safeGetStorage(key) {
-        try {
-            return sessionStorage.getItem(key) || localStorage.getItem(key) || '';
-        } catch (e) {
-            try { return localStorage.getItem(key) || ''; } catch (e2) {}
-        }
-        return '';
-    }
-
-    function safeSetStorage(key, val) {
-        try { sessionStorage.setItem(key, val); } catch (e) {}
-        try { localStorage.setItem(key, val); } catch (e) {}
-    }
-
-    function safeRemoveStorage(key) {
-        try { sessionStorage.removeItem(key); } catch (e) {}
-        try { localStorage.removeItem(key); } catch (e) {}
-    }
-
-    const defaultConfig = {
-        autoSelect: true,
-        autoNext: true,       // automatically advance to next question in test mode
-        baseSpeed: 2.0,       // average selection delay in seconds
-        randomize: true,      // randomize variance within +-20%
-        dynamicPacing: false, // auto-increase delay for longer questions (human simulator)
-        stealthLevel: 'ghost',// 'ghost' (super subtle underline) | 'subtle' (faint tint) | 'standard' (full border)
-        minimized: false      // minimize to small floating icon
-    };
-
-    function loadConfig() {
-        try {
-            const saved = safeGetStorage(CONFIG_KEY);
-            if (saved) {
-                const parsed = JSON.parse(saved);
-                return {
-                    ...defaultConfig,
-                    ...parsed,
-                    autoNext: typeof parsed.autoNext === 'boolean' ? parsed.autoNext : defaultConfig.autoNext,
-                    baseSpeed: (typeof parsed.baseSpeed === 'number' && !isNaN(parsed.baseSpeed)) ? Math.max(0.2, parsed.baseSpeed) : defaultConfig.baseSpeed,
-                    stealthLevel: ['ghost', 'subtle', 'standard'].includes(parsed.stealthLevel) ? parsed.stealthLevel : defaultConfig.stealthLevel
-                };
-            }
-        } catch (e) {}
-        return { ...defaultConfig };
-    }
-
-    function saveConfig(cfg) {
-        try {
-            safeSetStorage(CONFIG_KEY, JSON.stringify(cfg));
-        } catch (e) {}
-    }
-
-    let config = loadConfig();
-    const cachedAnswers = new Map();
-    let cachedQuestionsList = [];
-    let lastQuestionFingerprint = '';
-    let solveTimer = null;
-
-    let activeTimer = {
-        intervalId: null,
-        remainingMs: 0,
-        totalMs: 0,
-        isPaused: false,
-        answer: null,
-        questionData: null
-    };
-
-    function stopActiveTimer() {
-        if (activeTimer.intervalId) {
-            clearInterval(activeTimer.intervalId);
-            activeTimer.intervalId = null;
-        }
-        if (solveTimer) {
-            clearTimeout(solveTimer);
-            solveTimer = null;
-        }
-        activeTimer.isPaused = false;
-        activeTimer.answer = null;
-        activeTimer.questionData = null;
-    }
-
-    let currentApiKey = (safeGetStorage(STORAGE_KEY) || '').trim();
-
-    // ==========================================
-    // 5. DIACRITICS & TEXT NORMALIZATION
-    // ==========================================
-    function normalizeVietnameseWord(word) {
-        if (!word) return '';
-        if (/^[a-z0-9]+_[1-5]$/.test(word)) return word;
-        const toneMap = {
-            '\u0300': '1', // Huyền
-            '\u0301': '2', // Sắc
-            '\u0303': '3', // Ngã
-            '\u0309': '4', // Hỏi
-            '\u0323': '5'  // Nặng
-        };
-        const nfd = word.normalize('NFD');
-        let base = '';
-        let tone = '';
-        for (let i = 0; i < nfd.length; i++) {
-            const char = nfd[i];
-            if (toneMap[char]) {
-                tone = toneMap[char];
-            } else if (/[\u0300-\u036f]/.test(char)) {
-                continue; // strip secondary diacritics (hat, horn, breve)
-            } else {
-                base += char;
-            }
-        }
-        base = base.replace(/đ/g, 'd').replace(/Đ/g, 'd');
-        return (tone ? base + '_' + tone : base).normalize('NFC');
-    }
-
-    function stripOptionPrefix(text) {
-        if (!text) return '';
-        return text
-            .replace(/^\s*(?:câu|question|cau)\s*\d+[\s:.-]*/i, '')
-            .replace(/^\s*\d+[\s:.)-]+\s*/, '')
-            .replace(/^\s*[\(\[\{]?[A-Za-z0-9][\.\)\:\-\]\}\s]\s*/, '')
-            .replace(/^\s*[A-Za-z0-9]\s+/, '')
-            .trim();
-    }
-
-    function normalizeText(text) {
-        if (!text) return '';
-        let s = String(text);
-        s = s.replace(/<[^>]+>/g, ' ');
-        s = s.replace(/&nbsp;/gi, ' ')
-             .replace(/&amp;/gi, '&')
-             .replace(/&quot;/gi, ' ')
-             .replace(/&#39;|&apos;/gi, ' ')
-             .replace(/&lt;/gi, ' ')
-             .replace(/&gt;/gi, ' ')
-             .replace(/&ndash;/gi, ' ')
-             .replace(/&mdash;/gi, ' ');
-
-        s = s.replace(/^\s*(?:câu|question|cau)\s*\d+[\s:.-]*/i, ' ');
-        s = s.replace(/^\s*\d+[\s:.)-]+\s*/, ' ');
-        s = s.replace(/^\s*[\(\[\{]?[a-z0-9][\.\)\:\-\]\}\s]\s*/i, ' ');
-        s = s.replace(/["'“”‘’«»„‟`]/g, ' ')
-             .replace(/[–—―→\-><=…~]/g, ' ')
-             .replace(/_(?![1-5]\b)/g, ' ')
-             .replace(/[\u00a0\u200b\u200c\u200d\ufeff]/g, ' ')
-             .replace(/[.,/#!$%^&*;:{}=\`~()?\[\]{}|\\+<>@]/g, ' ');
-
-        const words = s.toLowerCase().trim().split(/\s+/).filter(Boolean);
-        return words.map(normalizeVietnameseWord).join(' ');
-    }
-
-    function getWordOverlap(str1, str2) {
-        if (!str1 || !str2) return 0;
-        const words1 = str1.split(/\s+/).filter(w => w.length >= 2);
-        const words2 = new Set(str2.split(/\s+/).filter(w => w.length >= 2));
-        if (words1.length === 0 || words2.size === 0) return 0;
-        let match = 0;
-        for (const w of words1) {
-            if (words2.has(w)) match++;
-        }
-        return match / Math.max(words1.length, words2.size);
-    }
-
-    function getOptionMatchScore(optRawText, target) {
-        if (!optRawText || !target) return 0;
-        const optClean = stripOptionPrefix(optRawText);
-        const optNorm = normalizeText(optClean);
-        const targetClean = stripOptionPrefix(target);
-        const targetNorm = normalizeText(targetClean);
-        if (!optNorm || !targetNorm) return 0;
-
-        // 1. Exact match = 100 points
-        if (optNorm === targetNorm) return 100;
-
-        // 2. Prefix / Suffix match = 85 points
-        if (optNorm.endsWith(' ' + targetNorm) || targetNorm.endsWith(' ' + optNorm)) return 85;
-        if (optNorm.startsWith(targetNorm + ' ') || targetNorm.startsWith(optNorm + ' ')) return 85;
-
-        // 3. Substring containment with high coverage
-        if (targetNorm.length >= 6 && optNorm.length >= 6) {
-            if (optNorm.includes(targetNorm)) {
-                const ratio = targetNorm.length / optNorm.length;
-                if (ratio >= 0.7) return Math.round(ratio * 80);
-            } else if (targetNorm.includes(optNorm)) {
-                const ratio = optNorm.length / targetNorm.length;
-                if (ratio >= 0.7) return Math.round(ratio * 80);
-            }
-        }
-
-        return 0;
-    }
-
-    function isOptionMatch(optRawText, targets) {
-        if (!optRawText || !targets) return false;
-        const targetList = Array.isArray(targets) ? targets : [targets];
-        return targetList.some(target => getOptionMatchScore(optRawText, target) >= 50);
-    }
-
-    function findMatchingOptions(options, answersArray, isMultipleChoice = false) {
-        if (!options || options.length === 0 || !answersArray || answersArray.length === 0) return [];
-
-        const targets = answersArray.filter(Boolean);
-        if (targets.length === 0) return [];
-
-        // If Single Choice: pick the single best option with highest score
-        if (!isMultipleChoice || targets.length === 1) {
-            const target = targets[0];
-            let bestOpt = null;
-            let highestScore = 0;
-
-            for (const opt of options) {
-                const score = getOptionMatchScore(opt.rawText, target);
-                if (score > highestScore) {
-                    highestScore = score;
-                    bestOpt = opt;
-                }
-            }
-
-            if (bestOpt && highestScore >= 50) {
-                return [bestOpt];
-            }
-            return [];
-        }
-
-        // If Multiple Choice (MSQ): for each target answer, pick best matching option
-        const matched = [];
-        for (const target of targets) {
-            let bestOpt = null;
-            let highestScore = 0;
-            for (const opt of options) {
-                if (matched.includes(opt)) continue;
-                const score = getOptionMatchScore(opt.rawText, target);
-                if (score > highestScore) {
-                    highestScore = score;
-                    bestOpt = opt;
-                }
-            }
-            if (bestOpt && highestScore >= 50) {
-                matched.push(bestOpt);
-            }
-        }
-        return matched;
-    }
-
-    const cleanTextForDisplay = (text) => text?.replace(/<p>|<\/p>/g, '').trim().replace(/\s+/g, ' ') || '';
-
-    function findGamePin() {
-        // 1. URL search params (gc, pin, gameCode, room, roomCode, quizId)
-        try {
-            const url = new URL(window.location.href);
-            for (const param of ['gc', 'pin', 'gameCode', 'room', 'roomCode', 'quizId']) {
-                const val = url.searchParams.get(param);
-                if (val) {
-                    const clean = val.replace(/\s+/g, '');
-                    if (clean.length === 6 || clean.length === 8) return clean;
-                }
-            }
-            const pathMatch = url.pathname.match(/\/(?:game|join)\/(\d{6,8})/);
-            if (pathMatch) return pathMatch[1];
-        } catch (e) {}
-
-        // 2. Storage check
-        try {
-            for (const storage of [sessionStorage, localStorage]) {
-                for (let i = 0; i < storage.length; i++) {
-                    const k = storage.key(i) || '';
-                    if (k.startsWith('wayground_') || k.startsWith('wg_')) continue;
-                    if (/pin|room|game/i.test(k)) {
-                        const val = storage.getItem(k) || '';
-                        const m = val.match(/"(?:gameCode|roomHash|pin|roomCode)":\s*"?(\d{6,8})"?/i) || val.match(/\b(\d{6,8})\b/);
-                        if (m) return m[1];
-                    }
-                }
-            }
-        } catch (e) {}
-
-        // 3. Known DOM elements
-        const domPin = document.querySelector('[data-testid*="game-code"], [data-testid*="pin"], .game-code, .room-pin, .pin-code, input[name="roomCode"]');
-        if (domPin) {
-            const txt = (domPin.value || domPin.textContent || '').replace(/\s+/g, '');
-            const m = txt.match(/\b(\d{6,8})\b/);
-            if (m) return m[1];
-        }
-
-        // 4. Tree walker across body
-        const pinRegex = /\b(\d{3,4})\s?(\d{3,4})\b/;
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-        let node;
-        while ((node = walker.nextNode())) {
-            const parent = node.parentElement;
-            if (!parent || ["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"].includes(parent.tagName)) continue;
-            if (parent.closest && parent.closest('#solver-panel, #solver-mini-icon, #wg-cheatsheet-modal, [data-wg-tool]')) continue;
-
-            const text = node.nodeValue.trim();
-            const match = text.match(pinRegex);
-            if (match) {
-                const pin = match[1] + match[2];
-                if (pin.length === 6 || pin.length === 8) {
-                    return pin;
-                }
-            }
-        }
-        return null;
-    }
-
-    // ==========================================
-    // 6. API AUTHENTICATION & ANSWER FETCHING
-    // ==========================================
-    async function authenticateWithKey(key, statusDisplay) {
-        if (!key) return false;
-        if (statusDisplay) {
-            statusDisplay.textContent = "⏳ Đang xác thực key...";
-            statusDisplay.style.color = "white";
-        }
-        return new Promise((resolve) => {
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: `https://api.cheatnetwork.eu/auth/redirect?backup=${encodeURIComponent(key)}`,
-                headers: { "Host": "api.cheatnetwork.eu" },
-                onload: (res) => {
-                    try {
-                        const data = JSON.parse(res.responseText);
-                        if (data?.success) {
-                            currentApiKey = key;
-                            safeSetStorage(STORAGE_KEY, key);
-                            resolve(true);
-                        } else {
-                            resolve(false);
-                        }
-                    } catch (e) {
-                        resolve(false);
-                    }
-                },
-                onerror: () => resolve(false)
-            });
-        });
-    }
-
-    async function fetchAndCacheAnswers(pin, statusDisplay, isRetry = false) {
-        if (!currentApiKey) return false;
-        if (statusDisplay) {
-            statusDisplay.textContent = isRetry ? "⏳ Đang tải lại..." : "⏳ Đang tải đáp án...";
-            statusDisplay.style.color = "white";
-        }
-
-        return new Promise((resolve) => {
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: `https://api.cheatnetwork.eu/quizizz/${pin}/answers`,
-                headers: {
-                    "Authorization": currentApiKey,
-                    "Host": "api.cheatnetwork.eu"
-                },
-                onload: async (res) => {
-                    try {
-                        const data = JSON.parse(res.responseText);
-
-                        if (res.status === 401 || data?.message === "Invalid API key" || data?.message?.includes("key")) {
-                            if (!isRetry) {
-                                statusDisplay.textContent = "⏳ Thử cấp lại quyền...";
-                                const reauth = await authenticateWithKey(currentApiKey);
-                                if (reauth) {
-                                    resolve(await fetchAndCacheAnswers(pin, statusDisplay, true));
-                                    return;
-                                } else {
-                                    statusDisplay.textContent = "❌ Key lỗi / Hết hạn";
-                                    statusDisplay.style.color = '#ff5555';
-                                    resolve(false);
-                                    return;
-                                }
-                            } else {
-                                statusDisplay.textContent = "❌ Truy cập bị từ chối";
-                                statusDisplay.style.color = '#ff5555';
-                                resolve(false);
-                                return;
-                            }
-                        }
-
-                        if (!data?.answers) throw new Error("No Data");
-                        cachedQuestionsList = [];
-                        data.answers.forEach(item => {
-                            if (!item.id && !item._id) return;
-                            const itemId = item.id || item._id;
-                            const qText = item.text || item.query?.text || item.structure?.query?.text || item.query?.media?.[0]?.url || '';
-                            const qOpts = item.options || item.structure?.options || [];
-                            cachedQuestionsList.push({ id: itemId, type: item.type, options: qOpts, text: qText });
-
-                            const rawAns = item.answer !== undefined ? item.answer : (item.structure?.answer !== undefined ? item.structure.answer : null);
-
-                            const extractOptionText = (opt) => {
-                                if (!opt) return '';
-                                if (typeof opt === 'string') return cleanTextForDisplay(opt);
-                                return cleanTextForDisplay(opt.text || opt.media?.[0]?.url || opt.id || '');
-                            };
-
-                            if (item.type === 'MSQ' && Array.isArray(rawAns)) {
-                                const multi = rawAns.map(idx => {
-                                    if (typeof idx === 'number' && qOpts[idx]) {
-                                        return extractOptionText(qOpts[idx]);
-                                    }
-                                    if (typeof idx === 'string') {
-                                        const parsed = parseInt(idx, 10);
-                                        if (!isNaN(parsed) && qOpts[parsed]) {
-                                            return extractOptionText(qOpts[parsed]);
-                                        }
-                                        return cleanTextForDisplay(idx);
-                                    }
-                                    return cleanTextForDisplay(idx);
-                                }).filter(Boolean);
-                                if (multi.length) cachedAnswers.set(itemId, multi);
-                            } else if (item.type === 'BLANK' || item.type === 'open') {
-                                const ans = Array.isArray(rawAns) ? rawAns[0] : (rawAns || item.text || '');
-                                if (ans) cachedAnswers.set(itemId, typeof ans === 'object' ? cleanTextForDisplay(ans.text || '') : cleanTextForDisplay(String(ans)));
-                            } else if (Array.isArray(rawAns) && rawAns.length > 0) {
-                                const first = rawAns[0];
-                                if (typeof first === 'number' && qOpts[first]) {
-                                    const optText = extractOptionText(qOpts[first]);
-                                    if (optText) cachedAnswers.set(itemId, optText);
-                                } else if (typeof first === 'string') {
-                                    const parsed = parseInt(first, 10);
-                                    if (!isNaN(parsed) && qOpts[parsed]) {
-                                        const optText = extractOptionText(qOpts[parsed]);
-                                        if (optText) cachedAnswers.set(itemId, optText);
-                                    } else {
-                                        cachedAnswers.set(itemId, cleanTextForDisplay(first));
-                                    }
-                                } else if (first?.text) {
-                                    cachedAnswers.set(itemId, cleanTextForDisplay(first.text));
-                                }
-                            } else if (typeof rawAns === 'number' && qOpts[rawAns]) {
-                                const optText = extractOptionText(qOpts[rawAns]);
-                                if (optText) cachedAnswers.set(itemId, optText);
-                            } else if (typeof rawAns === 'string') {
-                                const parsed = parseInt(rawAns, 10);
-                                if (!isNaN(parsed) && qOpts[parsed]) {
-                                    const optText = extractOptionText(qOpts[parsed]);
-                                    if (optText) cachedAnswers.set(itemId, optText);
-                                } else {
-                                    cachedAnswers.set(itemId, cleanTextForDisplay(rawAns));
-                                }
-                            }
-                        });
-                        resolve(cachedAnswers.size > 0);
-
-                    } catch (e) {
-                        if (!isRetry) {
-                            statusDisplay.textContent = "❌ Lỗi dữ liệu";
-                            statusDisplay.style.color = '#ff5555';
-                        }
-                        resolve(false);
-                    }
-                },
-                onerror: () => {
-                    statusDisplay.textContent = "❌ Lỗi mạng";
-                    statusDisplay.style.color = '#ff5555';
-                    resolve(false);
-                }
-            });
-        });
-    }
-
-    // ==========================================
-    // 7. QUESTION & ANSWER PROCESSING (CLASSIC & TEST MODE)
-    // ==========================================
-    function getActiveQuestionContainer() {
-        const candidates = Array.from(document.querySelectorAll('[data-quesid], [data-question-id], .question-container, [data-testid*="question-container"], .assessment-question, .question-card, main, [role="main"]'));
-        for (const el of candidates) {
-            if (el.offsetParent !== null && !el.classList.contains('hidden') && window.getComputedStyle(el).display !== 'none' && window.getComputedStyle(el).visibility !== 'hidden') {
-                return el;
-            }
-        }
-        return document.querySelector('[data-quesid]') || document.querySelector('.question-container') || document.querySelector('.question-card') || document.querySelector('#question-container') || document.body;
-    }
-
-    function getQuestionTitle(container) {
-        if (!container) return '';
-        const titleEl = container.querySelector(
-            '[data-testid="question-title"], .question-text, .question-text-color, .q-title, .question-title, #question-text, .typed-prompt, [class*="question-text"], [class*="questionText"], [class*="prompt"], [class*="query"], h1, h2, h3, h4'
-        );
-        if (titleEl) {
-            return titleEl.innerText || titleEl.textContent || '';
-        }
-        const pEls = Array.from(container.querySelectorAll('p, div'));
-        for (const p of pEls) {
-            if (p.closest && p.closest('.option, button, [role="radio"], [role="checkbox"], [data-wg-tool], #solver-panel, #solver-mini-icon, #wg-cheatsheet-modal')) continue;
-            const txt = (p.innerText || p.textContent || '').trim();
-            if (txt.length > 10) return txt;
-        }
-        return '';
-    }
-
-    function getOptionRawText(el) {
-        if (!el) return '';
-        try {
-            // Clone and strip circular badges, letters, icons
-            const clone = el.cloneNode(true);
-            clone.querySelectorAll(
-                '[class*="marker"], [class*="badge"], [class*="index"], [class*="letter"], [class*="circle"], [class*="indicator"], [aria-hidden="true"], svg'
-            ).forEach(node => {
-                const t = (node.innerText || node.textContent || '').trim();
-                if (t.length <= 4) {
-                    node.remove();
-                }
-            });
-            const clean = (clone.innerText || clone.textContent || '').trim();
-            if (clean.length > 0) {
-                return clean;
-            }
-        } catch (e) {}
-
-        const textNode = el.querySelector('.option-text-inner, [class*="option-text"], [class*="optionText"], [class*="text-container"], [class*="choice-text"], .resizeable-text, p');
-        let txt = textNode ? (textNode.innerText || textNode.textContent || '') : (el.innerText || el.textContent || '');
-        const imgAlt = el.querySelector('img')?.alt || el.querySelector('img')?.src || '';
-        return (txt || imgAlt || '').trim();
-    }
-
-    function getCurrentQuestionData() {
-        const questionContainer = getActiveQuestionContainer() || document.body;
-
-        let questionId = questionContainer.dataset?.quesid ||
-            questionContainer.dataset?.questionId ||
-            questionContainer.getAttribute?.('data-quesid') ||
-            questionContainer.getAttribute?.('data-question-id') ||
-            '';
-
-        // Find standard option elements (including Quizizz Test Mode option-trigger buttons)
-        const optionSelector = '[data-testid^="option-trigger-"], [data-testid*="option-trigger"], [data-testid^="option-"], [data-cy^="option-"], .option.is-selectable, .option, button[class*="option"], [role="radio"], [role="checkbox"], .choice-btn, label[class*="option"], [class*="choice-item"], [data-testid*="choice"], div[class*="option-container"]';
-        let optionEls = Array.from(questionContainer.querySelectorAll(optionSelector));
-        if (optionEls.length === 0) {
-            optionEls = Array.from(document.querySelectorAll(optionSelector));
-        }
-        optionEls = optionEls.filter(el => el.offsetParent !== null && !isToolElement(el));
-
-        // CRITICAL: Filter out parent containers that wrap other options!
-        if (optionEls.length > 1) {
-            optionEls = optionEls.filter((el, idx, arr) => {
-                const isParent = arr.some(other => other !== el && el.contains(other));
-                return !isParent;
-            });
-        }
-
-        // Match active question against cachedQuestionsList (robust against question & option shuffling)
-        let activeQuestionItem = null;
-        if (cachedQuestionsList.length > 0) {
-            const domTitle = getQuestionTitle(questionContainer);
-            const normDomTitle = normalizeText(domTitle);
-            const normDomOptions = optionEls.map(el => normalizeText(getOptionRawText(el))).filter(t => t.length > 0);
-            const normContainerText = normalizeText(questionContainer.innerText || document.body.innerText || '');
-
-            let bestItem = null;
-            let highestScore = 0;
-
-            for (const item of cachedQuestionsList) {
-                const qRawText = item.text || item.query?.text || item.structure?.query?.text || '';
-                const normItemTitle = normalizeText(qRawText);
-                const itemOpts = (item.options || item.structure?.options || []).map(o => {
-                    const t = typeof o === 'string' ? o : (o.text || o.media?.[0]?.url || '');
-                    return normalizeText(t);
-                }).filter(t => t.length > 0);
-
-                let score = 0;
-
-                // 1. Direct ID match
-                if (questionId && (item.id === questionId || item._id === questionId)) {
-                    score += 200;
-                }
-
-                // 2. Question Title match
-                if (normDomTitle && normItemTitle) {
-                    if (normDomTitle === normItemTitle) {
-                        score += 150;
-                    } else if (normDomTitle.includes(normItemTitle) || normItemTitle.includes(normDomTitle)) {
-                        score += 100;
-                    } else {
-                        const overlap = getWordOverlap(normDomTitle, normItemTitle);
-                        if (overlap >= 0.5) {
-                            score += Math.round(overlap * 90);
-                        }
-                    }
-                }
-
-                // 3. Option texts match (even when options or questions are shuffled!)
-                if (normDomOptions.length > 0 && itemOpts.length > 0) {
-                    let matchedCount = 0;
-                    for (const domOpt of normDomOptions) {
-                        if (domOpt.length < 2) continue;
-                        const matched = itemOpts.some(targetOpt => {
-                            if (domOpt === targetOpt) return true;
-                            if (domOpt.endsWith(' ' + targetOpt) || targetOpt.endsWith(' ' + domOpt)) return true;
-                            if (domOpt.startsWith(targetOpt + ' ') || targetOpt.startsWith(domOpt + ' ')) return true;
-                            if (domOpt.length >= 5 && targetOpt.length >= 5 && (domOpt.includes(targetOpt) || targetOpt.includes(domOpt))) return true;
-                            return false;
-                        });
-                        if (matched) matchedCount++;
-                    }
-
-                    if (matchedCount >= 3) {
-                        score += 120;
-                    } else if (matchedCount === 2) {
-                        score += 70;
-                    } else if (matchedCount === 1) {
-                        score += 25;
-                    }
-                }
-
-                // 4. Container text fallback
-                if (score < 40 && normContainerText && normItemTitle && normItemTitle.length > 8) {
-                    if (normContainerText.includes(normItemTitle)) {
-                        score += 60;
-                    } else {
-                        const overlap = getWordOverlap(normContainerText, normItemTitle);
-                        if (overlap >= 0.6) {
-                            score += Math.round(overlap * 50);
-                        }
-                    }
-                }
-
-                if (score > highestScore) {
-                    highestScore = score;
-                    bestItem = item;
-                }
-            }
-
-            if (bestItem && highestScore >= 25) {
-                activeQuestionItem = bestItem;
-                questionId = bestItem.id;
-            }
-        }
-
-        // Test Mode Fallback: Find elements by expected option texts
-        if (optionEls.length === 0 && activeQuestionItem) {
-            const expectedOpts = activeQuestionItem.options || activeQuestionItem.structure?.options || [];
-            if (Array.isArray(expectedOpts) && expectedOpts.length > 0) {
-                const foundOpts = [];
-                for (const expected of expectedOpts) {
-                    const targetText = typeof expected === 'string' ? expected : (expected.text || expected.media?.[0]?.url || '');
-                    if (!targetText) continue;
-                    const normTarget = normalizeText(targetText);
-
-                    const allNodes = Array.from(document.querySelectorAll('button, [role="button"], [role="radio"], div[class*="option"], div[class*="choice"], div[class*="cursor"], div[class*="item"], p, span'));
-                    for (const node of allNodes) {
-                        if (node.offsetParent === null || isToolElement(node)) continue;
-                        const txt = normalizeText(node.innerText || node.textContent || '');
-
-                        if (txt === normTarget || (normTarget.length >= 5 && (txt.includes(normTarget) || normTarget.includes(txt)))) {
-                            const clickable = node.closest('button, [role="radio"], [role="button"], [role="checkbox"], div[class*="cursor"], div[class*="option"], div[class*="choice"], div[class*="card"], li') || node;
-                            if (!foundOpts.includes(clickable) && !isToolElement(clickable)) {
-                                foundOpts.push(clickable);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (foundOpts.length > 0) {
-                    optionEls = foundOpts;
-                }
-            }
-        }
-
-        if (optionEls.length > 0) {
-            const options = optionEls.map(el => {
-                return {
-                    rawText: getOptionRawText(el),
-                    element: el
-                };
-            });
-            return { questionId, type: 'CHOICE', options, container: questionContainer };
-        }
-
-        const inputEl = document.querySelector('input.question-input, textarea.question-input, input[type="text"], textarea');
-        if (inputEl && inputEl.offsetParent !== null && !isToolElement(inputEl)) {
-            return { questionId, type: 'BLANK', inputEl, container: questionContainer };
-        }
-
-        return null;
-    }
-
-    function clearHighlights() {
-        document.querySelectorAll('.wg-correct-highlight').forEach(el => {
-            el.classList.remove('wg-correct-highlight');
-            el.style.backgroundColor = '';
-            el.style.boxShadow = '';
-            el.style.borderRadius = '';
-            el.style.border = '';
-        });
-        document.querySelectorAll('.wg-correct-text').forEach(el => {
-            el.classList.remove('wg-correct-text');
-            el.style.fontWeight = '';
-            el.style.letterSpacing = '';
-        });
-    }
-
-    // Smart & discreet answer highlighting directly on the Wayground interface
-    function highlightCorrectAnswers(answer, questionData) {
-        if (!questionData) return;
-        clearHighlights();
-
-        if (questionData.type === 'CHOICE' && questionData.options) {
-            const answersArray = Array.isArray(answer) ? answer : [answer];
-            const isMSQ = questionData.isMSQ || (Array.isArray(answer) && answer.length > 1);
-            const matchingOpts = findMatchingOptions(questionData.options, answersArray, isMSQ);
-
-            matchingOpts.forEach(opt => {
-                opt.element.classList.add('wg-correct-highlight');
-
-                if (config.stealthLevel === 'ghost') {
-                    // Ghost: Ultra-discreet, virtually transparent background, subtle underline only
-                    opt.element.style.setProperty('background-color', 'rgba(34, 197, 94, 0.03)', 'important');
-                    opt.element.style.setProperty('box-shadow', 'inset 0 -2.5px 0 0 rgba(74, 222, 128, 0.38)', 'important');
-                    opt.element.style.setProperty('border-radius', '6px', 'important');
-                } else if (config.stealthLevel === 'subtle') {
-                    // Subtle: Faint green tint
-                    opt.element.style.setProperty('background-color', 'rgba(34, 197, 94, 0.08)', 'important');
-                    opt.element.style.setProperty('box-shadow', '0 0 0 1.5px rgba(34, 197, 94, 0.22)', 'important');
-                    opt.element.style.setProperty('border-radius', '8px', 'important');
-                } else {
-                    // Standard: Clear border
-                    opt.element.style.setProperty('background-color', 'rgba(34, 197, 94, 0.12)', 'important');
-                    opt.element.style.setProperty('box-shadow', '0 0 0 2px rgba(34, 197, 94, 0.4)', 'important');
-                    opt.element.style.setProperty('border-radius', '8px', 'important');
-                }
-
-                const textInner = opt.element.querySelector('.option-text-inner, .text-container, p, span') || opt.element;
-                textInner.classList.add('wg-correct-text');
-                textInner.style.setProperty('font-weight', config.stealthLevel === 'ghost' ? '600' : '700', 'important');
-            });
-        } else if (questionData.type === 'BLANK' && questionData.inputEl) {
-            const textAnswer = Array.isArray(answer) ? answer[0] : answer;
-            const cleanAns = cleanTextForDisplay(textAnswer);
-            if (!questionData.inputEl.value) {
-                questionData.inputEl.setAttribute('placeholder', `💡 Đáp án: ${cleanAns}`);
-            }
-        }
-    }
-
-    function triggerClick(el) {
-        if (!el) return;
-        try {
-            const target = el.querySelector('button, [role="button"], [role="radio"], [role="checkbox"], input, label') || el;
-
-            if (typeof window.PointerEvent === 'function') {
+            if (this._url && infractions.test(this._url)) {
+                console.group('%c[Security] Request Blocked', 'color: red; font-weight: bold;');
                 try {
-                    target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, view: window }));
-                    target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerId: 1, isPrimary: true, view: window }));
-                } catch (e) {}
-            }
-
-            try {
-                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-            } catch (e) {}
-
-            try {
-                if (typeof target.click === 'function') {
-                    target.click();
-                } else {
-                    target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    const payload = JSON.parse(body);
+                    console.log('%cBlocked payload:', 'font-weight: bold;', payload);
+                } catch (e) {
+                    console.log('%cBlocked raw payload:', 'font-weight: bold;', body, e);
                 }
-            } catch (e) {}
-
-            if (target.tagName === 'INPUT' && (target.type === 'radio' || target.type === 'checkbox')) {
-                target.checked = true;
-                target.dispatchEvent(new Event('change', { bubbles: true }));
-                target.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-        } catch (e) {
-            try { el.click(); } catch (err) {}
-        }
-    }
-
-    function findNextButton() {
-        const buttons = Array.from(document.querySelectorAll('button, [role="button"], a[role="button"], div[role="button"]'));
-        return buttons.find(btn => {
-            if (btn.offsetParent === null || btn.disabled) return false;
-            if (btn.closest && btn.closest('#solver-panel, #solver-mini-icon, #wg-cheatsheet-modal, [data-wg-tool]')) return false;
-
-            // NEVER click buttons inside modals, dialogs, popups or alerts!
-            if (btn.closest && btn.closest('[role="dialog"], [role="alertdialog"], .modal, .dialog, .popup, [class*="modal"], [class*="dialog"], [class*="popup"], [class*="overlay"]')) {
-                return false;
-            }
-
-            const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-            const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-            const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
-            const className = (btn.className || '').toLowerCase();
-
-            // EXCLUDE final submission / finish buttons!
-            if (text.includes('nộp bài kiểm tra') || text.includes('submit exam') || text.includes('submit test') || text.includes('kết thúc bài') || text.includes('finish quiz') || text.includes('end quiz') || text.includes('end test')) {
-                return false;
-            }
-
-            // EXCLUDE attempt / session / exit / error modal controls!
-            if (text.includes('attempt') || ariaLabel.includes('attempt') || testId.includes('attempt') || className.includes('attempt')) {
-                return false;
-            }
-            if (['exit', 'thoát', 'try again', 'thử lại', 'retry', 'resume', 'lần làm', 'lượt làm'].some(k => text.includes(k) || ariaLabel.includes(k) || testId.includes(k))) {
-                return false;
-            }
-
-            // Positive matches for NEXT QUESTION
-            if (ariaLabel.includes('next') || ariaLabel.includes('tiếp') || ariaLabel.includes('tiếp theo')) return true;
-            if (text === 'next' || text === 'tiếp theo' || text === 'tiếp' || text.startsWith('next ') || text.includes('câu tiếp') || text.includes('câu sau') || text.includes('câu tiếp theo')) return true;
-            if (testId.includes('next') || testId.includes('arrow-right')) return true;
-            if (className.includes('nav-button-next') || className.includes('next-btn') || className.includes('next-button')) return true;
-            if (btn.querySelector('i.fa-arrow-right, i.fa-chevron-right, svg[data-icon="arrow-right"], svg[data-icon="chevron-right"], [data-icon="chevron-right"]')) return true;
-
-            return false;
-        });
-    }
-
-    function findPrevButton() {
-        const buttons = Array.from(document.querySelectorAll('button, [role="button"], a[role="button"], div[role="button"]'));
-        return buttons.find(btn => {
-            if (btn.offsetParent === null || btn.disabled) return false;
-            if (btn.closest && btn.closest('#solver-panel, #solver-mini-icon, #wg-cheatsheet-modal, [data-wg-tool]')) return false;
-
-            // NEVER click buttons inside modals, dialogs, popups or alerts!
-            if (btn.closest && btn.closest('[role="dialog"], [role="alertdialog"], .modal, .dialog, .popup, [class*="modal"], [class*="dialog"], [class*="popup"], [class*="overlay"]')) {
-                return false;
-            }
-
-            const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-            const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-            const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
-            const className = (btn.className || '').toLowerCase();
-
-            // EXCLUDE attempt / session / exit / error modal controls!
-            if (text.includes('attempt') || ariaLabel.includes('attempt') || testId.includes('attempt') || className.includes('attempt')) {
-                return false;
-            }
-            if (['exit', 'thoát', 'try again', 'thử lại', 'retry', 'resume', 'lần làm', 'lượt làm'].some(k => text.includes(k) || ariaLabel.includes(k) || testId.includes(k))) {
-                return false;
-            }
-
-            // Positive matches for PREV QUESTION
-            if (ariaLabel.includes('prev') || ariaLabel.includes('trước') || ariaLabel.includes('quay lại')) return true;
-            if (text === 'prev' || text === 'previous' || ['quay lại', 'câu trước', 'trước'].includes(text) || text.includes('câu trước')) return true;
-            if (testId.includes('prev') || testId.includes('arrow-left')) return true;
-            if (className.includes('nav-button-prev') || className.includes('prev-btn') || className.includes('prev-button')) return true;
-            if (btn.querySelector('i.fa-arrow-left, i.fa-chevron-left, svg[data-icon="arrow-left"], svg[data-icon="chevron-left"]')) return true;
-
-            return false;
-        });
-    }
-
-    function advanceNextQuestion() {
-        const nextBtn = findNextButton();
-        if (nextBtn) {
-            triggerClick(nextBtn);
-            return true;
-        }
-        try {
-            window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, bubbles: true }));
-            window.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, bubbles: true }));
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    function advancePrevQuestion() {
-        const prevBtn = findPrevButton();
-        if (prevBtn) {
-            triggerClick(prevBtn);
-            return true;
-        }
-        try {
-            window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37, bubbles: true }));
-            window.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37, bubbles: true }));
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    function solveQuestion(answer, questionData) {
-        const safeSubmitOrNext = (attempts = 0) => {
-            if (attempts > 4) return;
-
-            // In Test Mode: check if Next button exists
-            const nextBtn = findNextButton();
-            if (nextBtn) {
-                if (config.autoNext) {
-                    advanceNextQuestion();
-                }
+                console.groupEnd();
                 return;
             }
 
-            // In Game Mode: check per-question submit button
-            const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
-            const submitBtn = buttons.find(btn => {
-                if (btn.closest && btn.closest('#solver-panel, #solver-mini-icon, #wg-cheatsheet-modal, [data-wg-tool]')) return false;
-                const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-                // STRICT SAFETY: NEVER click exam submission buttons!
-                if (text.includes('nộp bài kiểm tra') || text.includes('submit exam') || text.includes('submit test') || text.includes('kết thúc bài') || text.includes('finish quiz') || text.includes('end quiz') || text.includes('end test')) {
-                    return false;
-                }
-                return ['submit', 'nộp', 'nộp bài', 'trả lời'].includes(text) ||
-                    btn.classList.contains('submit-btn');
-            });
+            const isJoin = join.test(this._url);
+            const isRejoin = rejoin.test(this._url);
+            const isSoloJoin = soloJoin.test(this._url);
+            const isBase = base.test(this._url);
+            const isCheckRoom = checkRoom.test(this._url);
+            const isCheckRoomAsignment = checkRoomAsignmets.test(this._url);
 
-            if (submitBtn && !submitBtn.disabled && submitBtn.offsetParent !== null) {
-                triggerClick(submitBtn);
-            } else if (attempts < 3) {
-                setTimeout(() => safeSubmitOrNext(attempts + 1), 400);
-            }
-        };
-
-        if (questionData.type === 'CHOICE') {
-            const answersArray = Array.isArray(answer) ? answer : [answer];
-            const isMSQ = questionData.isMSQ || (Array.isArray(answer) && answer.length > 1);
-            const matchingOpts = findMatchingOptions(questionData.options, answersArray, isMSQ);
-            let scriptDidClick = false;
-
-            matchingOpts.forEach(opt => {
-                opt.element.style.border = '2px solid rgba(34, 197, 94, 0.6)';
-                triggerClick(opt.element);
-                scriptDidClick = true;
-            });
-
-            if (scriptDidClick && config.autoSelect) {
-                setTimeout(() => safeSubmitOrNext(), 850);
-            }
-        } else if (questionData.type === 'BLANK' && questionData.inputEl) {
-            const textAnswer = Array.isArray(answer) ? answer[0] : answer;
-            questionData.inputEl.value = textAnswer;
-            questionData.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-            questionData.inputEl.dispatchEvent(new Event('change', { bubbles: true }));
-            if (config.autoSelect) {
-                setTimeout(() => safeSubmitOrNext(), 850);
-            }
-        }
-    }
-
-    let isAutoFilling = false;
-    let autoFillTimer = null;
-
-    function stopAutoFill() {
-        isAutoFilling = false;
-        if (autoFillTimer) {
-            clearTimeout(autoFillTimer);
-            autoFillTimer = null;
-        }
-        const autoFillBtn = document.getElementById('wg-autofill-btn');
-        if (autoFillBtn) {
-            autoFillBtn.textContent = '🚀 Giải Cả Đề';
-            autoFillBtn.classList.remove('wg-chip-active');
-        }
-    }
-
-    async function runAutoFillAll(statusDisplay) {
-        if (isAutoFilling) {
-            stopAutoFill();
-            statusDisplay.textContent = '⏸️ Đã dừng tự động';
-            return;
-        }
-
-        isAutoFilling = true;
-        const autoFillBtn = document.getElementById('wg-autofill-btn');
-        if (autoFillBtn) {
-            autoFillBtn.textContent = '⏹️ Dừng Giải';
-            autoFillBtn.classList.add('wg-chip-active');
-        }
-
-        const step = async () => {
-            if (!isAutoFilling) return;
-
-            const qd = getCurrentQuestionData();
-            if (qd && cachedAnswers.has(qd.questionId)) {
-                const ans = cachedAnswers.get(qd.questionId);
-                highlightCorrectAnswers(ans, qd);
-                solveQuestion(ans, qd);
-            }
-
-            await new Promise(r => setTimeout(r, 600));
-            if (!isAutoFilling) return;
-
-            const nextBtn = findNextButton();
-            if (nextBtn) {
-                advanceNextQuestion();
-                autoFillTimer = setTimeout(step, 800);
-            } else {
-                stopAutoFill();
-                statusDisplay.innerHTML = '🎉 <b>Đã điền hết tất cả câu!</b> Hãy kiểm tra và tự nộp bài.';
-                statusDisplay.style.color = '#50fa7b';
-            }
-        };
-
-        step();
-    }
-
-    function updateTimerDisplay() {
-        const secEl = document.getElementById('wg-timer-sec');
-        const barEl = document.getElementById('wg-progress-bar');
-        if (secEl) {
-            const sec = Math.max(0, (activeTimer.remainingMs / 1000)).toFixed(1);
-            secEl.textContent = `${sec}s`;
-        }
-        if (barEl && activeTimer.totalMs > 0) {
-            const pct = Math.min(100, Math.max(0, (activeTimer.remainingMs / activeTimer.totalMs) * 100));
-            barEl.style.width = `${pct}%`;
-        }
-    }
-
-    function renderLiveTimerUI(statusDisplay, displayAnswerText, variancePct) {
-        const secStr = Math.max(0, (activeTimer.remainingMs / 1000)).toFixed(1);
-        const varStr = config.randomize ? ` (${variancePct >= 0 ? '+' : ''}${variancePct}%)` : '';
-        const paceStr = config.dynamicPacing ? ' 🧠' : '';
-
-        statusDisplay.innerHTML = `
-            <div style="font-weight: 600; color: #38bdf8; margin-bottom: 2px;">💡 Đáp án:</div>
-            <div style="font-size: 13px; font-weight: 700; color: #50fa7b; margin-bottom: 4px;">${displayAnswerText}</div>
-            <div class="wg-countdown-wrap">
-                <div style="display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8;">
-                    <span>Tự chọn sau: <b id="wg-timer-sec" style="color: #f8fafc;">${secStr}s</b>${varStr}${paceStr}</span>
-                </div>
-                <div class="wg-progress-bg">
-                    <div id="wg-progress-bar" class="wg-progress-bar" style="width: 100%;"></div>
-                </div>
-                <div class="wg-live-timer-controls">
-                    <button id="wg-timer-now-btn" class="wg-chip-btn" style="color: #38bdf8; font-weight: 600;">⚡ Chọn ngay</button>
-                    <button id="wg-timer-pause-btn" class="wg-chip-btn">⏸️ Dừng</button>
-                    <button id="wg-timer-minus-btn" class="wg-chip-btn" title="Giảm 1s">−1s</button>
-                    <button id="wg-timer-plus-btn" class="wg-chip-btn" title="Thêm 1s">+1s</button>
-                </div>
-            </div>
-        `;
-
-        const nowBtn = document.getElementById('wg-timer-now-btn');
-        const pauseBtn = document.getElementById('wg-timer-pause-btn');
-        const minusBtn = document.getElementById('wg-timer-minus-btn');
-        const plusBtn = document.getElementById('wg-timer-plus-btn');
-
-        if (nowBtn) {
-            nowBtn.onclick = (e) => {
-                if (e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-                const ans = activeTimer.answer;
-                const qd = activeTimer.questionData;
-                stopActiveTimer();
-                if (ans && qd) solveQuestion(ans, qd);
-            };
-        }
-        if (pauseBtn) {
-            pauseBtn.onclick = (e) => {
-                if (e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-                activeTimer.isPaused = !activeTimer.isPaused;
-                pauseBtn.textContent = activeTimer.isPaused ? '▶️ Tiếp' : '⏸️ Dừng';
-            };
-        }
-        if (minusBtn) {
-            minusBtn.onclick = (e) => {
-                if (e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-                if (!activeTimer.intervalId && activeTimer.remainingMs <= 0) return;
-                activeTimer.remainingMs = Math.max(100, activeTimer.remainingMs - 1000);
-                activeTimer.totalMs = Math.max(activeTimer.remainingMs, activeTimer.totalMs - 1000);
-                updateTimerDisplay();
-            };
-        }
-        if (plusBtn) {
-            plusBtn.onclick = (e) => {
-                if (e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-                if (!activeTimer.intervalId && activeTimer.remainingMs <= 0) return;
-                activeTimer.remainingMs += 1000;
-                activeTimer.totalMs += 1000;
-                updateTimerDisplay();
-            };
-        }
-    }
-
-    async function mainSolver(statusDisplay) {
-        stopActiveTimer();
-
-        const questionData = getCurrentQuestionData();
-        if (!questionData?.questionId) return;
-
-        // Synchronize fingerprint immediately so subsequent DOM changes don't misidentify this question as a new one
-        lastQuestionFingerprint = getQuestionFingerprint();
-
-        const answer = cachedAnswers.get(questionData.questionId);
-        if (answer) {
-            const displayAnswerText = Array.isArray(answer) ? answer.map(cleanTextForDisplay).join('<br>') : cleanTextForDisplay(answer);
-
-            // 1. Highlight answer with stealth settings
-            highlightCorrectAnswers(answer, questionData);
-
-            // 2. Auto or Manual mode
-            if (config.autoSelect) {
-                let delayMs = Math.max(300, Math.round(config.baseSpeed * 1000));
-                let variancePct = 0;
-                if (config.randomize) {
-                    const variance = (Math.random() * 0.4) - 0.2;
-                    variancePct = Math.round(variance * 100);
-                    delayMs = Math.max(200, Math.round(delayMs * (1 + variance)));
-                }
-
-                if (config.dynamicPacing && questionData) {
-                    let textLen = 0;
-                    if (questionData.options) {
-                        textLen = questionData.options.reduce((sum, o) => sum + (o.rawText?.length || 0), 0);
+            if (this._url && (isJoin || isRejoin || isSoloJoin || isBase || isCheckRoom || isCheckRoomAsignment)) {
+                this.addEventListener('load', function () {
+                    function applyPatches(xhrInstance, modifiedResponse) {
+                        Object.defineProperty(xhrInstance, 'responseText', {
+                            get: () => modifiedResponse,
+                            configurable: true
+                        });
+                        Object.defineProperty(xhrInstance, 'response', {
+                            get: () => modifiedResponse,
+                            configurable: true
+                        });
                     }
-                    const extraMs = Math.min(2500, Math.floor(textLen / 40) * 500);
-                    delayMs += extraMs;
-                }
 
-                activeTimer.remainingMs = delayMs;
-                activeTimer.totalMs = delayMs;
-                activeTimer.isPaused = false;
-                activeTimer.answer = answer;
-                activeTimer.questionData = questionData;
-
-                renderLiveTimerUI(statusDisplay, displayAnswerText, variancePct);
-
-                const tickMs = 100;
-                activeTimer.intervalId = setInterval(() => {
-                    if (activeTimer.isPaused) return;
-
-                    activeTimer.remainingMs -= tickMs;
-                    if (activeTimer.remainingMs <= 0) {
-                        const ans = activeTimer.answer;
-                        const qd = activeTimer.questionData;
-                        stopActiveTimer();
-                        if (ans && qd) {
-                            solveQuestion(ans, qd);
+                    try {
+                        let quizId = null;
+                        if (isJoin) {
+                            const data = JSON.parse(this.responseText);
+                            try {
+                                data.room.options.antiCheating.enabled = false;
+                                data.room.options.focusMode = false;
+                                data.room.options.disableCopyPaste = false;
+                                data.room.options.disableRightClick = false;
+                                data.room.options.alertOnInfraction = false;
+                                ANTI_CHEAT = true;
+                                showNotification("Anti-cheat disabled");
+                                console.log("Anti-cheat disabled");
+                            } catch {
+                                ANTI_CHEAT = false;
+                                showNotification("Failed to disable anti-cheat", "#af4c4c");
+                                console.log("Failed to disable anti-cheat");
+                            }
+                            const modifiedResponse = JSON.stringify(data);
+                            applyPatches(this, modifiedResponse);
+                            ROOM_DATA = data?.room;
+                            QUIZ_NAME = data?.room?.name;
+                            TYPE_QUIZ = data?.room?.type;
+                            startQuizSolver(data?.room);
+                        } else if (isRejoin) {
+                            const data = JSON.parse(this.responseText);
+                            if(data?.data?.room?.type === 'solo'){
+                                fetchQuizDataId(data?.data?.room?.hash)
+                                .then((_id) => {
+                                    if (_id) {
+                                        console.log("Quiz ID retrieved successfully:", _id);
+                                        fetchQuizAnswers(_id);
+                                    }
+                                })
+                                    .catch((error) => {
+                                    console.error("Failed to get quiz ID:", error);
+                                });
+                            }else{
+                                try {
+                                    data.data.room.options.antiCheating.enabled = false;
+                                    data.data.room.options.focusMode = false;
+                                    data.data.room.options.disableCopyPaste = false;
+                                    data.data.room.options.disableRightClick = false;
+                                    data.data.room.options.alertOnInfraction = false;
+                                    ANTI_CHEAT = true;
+                                    showNotification("Anti-cheat disabled");
+                                    console.log("Anti-cheat disabled");
+                                } catch {
+                                    ANTI_CHEAT = false;
+                                    showNotification("Failed to disable anti-cheat", "#af4c4c");
+                                    console.log("Failed to disable anti-cheat");
+                                }
+                                const modifiedResponse = JSON.stringify(data);
+                                applyPatches(this, modifiedResponse);
+                                ROOM_DATA = data?.data?.room;
+                                QUIZ_NAME = data?.data?.room?.name;
+                                TYPE_QUIZ = data?.data?.room?.type;
+                                startQuizSolver(data?.data?.room);
+                            }
+                        } else if (isSoloJoin) {
+                            const data = JSON.parse(body);
+                            quizId = data.quizId;
+                            fetchQuizAnswers(quizId);
+                        } else if (isBase) {
+                            const data = JSON.parse(this.responseText);
+                            quizId = data.data?.quizInfo?.quizId;
+                            fetchQuizAnswers(quizId);
+                        } else if(isCheckRoomAsignment) {
+                            const data = JSON.parse(this.responseText);
+                            console.log("Assignment room response:", data);
+                            try {
+                                data.room.options.antiCheating.enabled = false;
+                                data.room.options.focusMode = false;
+                                data.room.options.reviewAndSubmit = true;
+                                data.room.options.timer = false;
+                                data.room.options.redemption = "yes";
+                                data.room.options.studentQuizReview_2 = "yes";
+                                console.log("Anti-cheat disabled");
+                            const modifiedResponse = JSON.stringify(data);
+                            applyPatches(this, modifiedResponse);
+                            } catch {
+                                console.log("Failed to disable anti-cheat");
+                            }
+                        } else {
+                        console.error("Request type does not match any registered request.");
                         }
-                    } else {
-                        updateTimerDisplay();
+                    } catch (e) {
+                        console.error('Error in game join flow:', e);
                     }
-                }, tickMs);
-            } else {
-                // Manual mode: Highlight answer only, no countdown
-                statusDisplay.innerHTML = `
-                    <div style="font-weight: 600; color: #38bdf8; margin-bottom: 2px;">💡 Đáp án (Thủ công):</div>
-                    <div style="font-size: 13px; font-weight: 700; color: #50fa7b; margin-bottom: 4px;">${displayAnswerText}</div>
-                    <div style="margin-top: 4px;">
-                        <button id="wg-manual-solve-btn" class="wg-chip-btn" style="color: #38bdf8; font-weight: 600;">⚡ Bấm chọn đáp án này ngay</button>
-                    </div>
-                `;
-                const manualBtn = document.getElementById('wg-manual-solve-btn');
-                if (manualBtn) {
-                    manualBtn.onclick = () => solveQuestion(answer, questionData);
-                }
+                });
             }
-        } else {
-            statusDisplay.textContent = "🔍 Không có đáp án câu này";
-            statusDisplay.style.color = "#ffb86c";
+        } catch (e) {
+            console.error("Critical error in .send interceptor:", e);
         }
+        return originalSend.apply(this, arguments);
+    };
+
+    function fetchQuizDataId(hash) {
+        const cleanRoomId = hash.toString().trim();
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://wayground.com/_gameapi/main/public/v1/students/games/${cleanRoomId}`,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0'
+                },
+                onload: function (response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+
+                        if (!data) {
+                            reject("No data found");
+                            return;
+                        }
+                        resolve(data?.data?.items[0]?.quizId)
+
+                    } catch (e) {
+                        showNotification("Error processing quiz API data", "#af4c4c");
+                        console.error('Error processing quiz API data', e);
+                        reject(e);
+                    }
+                },
+                onerror: function (err) {
+                    showNotification("GM_xmlhttpRequest failed", "#af4c4c");
+                    console.error("GM_xmlhttpRequest failed", err);
+                    reject(err);
+                }
+            });
+        });
     }
 
-    function getQuestionFingerprint() {
-        const qd = getCurrentQuestionData();
-        if (!qd) return '';
-        const optSummary = (qd.options || []).map(o => o.rawText).join('|');
-        return `${qd.questionId}__${optSummary}`;
-    }
+    let shadow = null;
 
-    function checkQuestionChange(statusDisplay) {
-        const fp = getQuestionFingerprint();
-        if (fp && fp !== lastQuestionFingerprint) {
-            stopActiveTimer();
-            lastQuestionFingerprint = fp;
-            mainSolver(statusDisplay);
-        }
-    }
+    function toLoad() {
+        try {
+            const mainBody = document.body;
+            let html = null;
 
-    // ==========================================
-    // 8. USER INTERFACE INITIALIZATION
-    // ==========================================
-    function setupUI() {
-        if (document.getElementById('solver-panel')) return;
+            if (mainBody) {
+                html = document.documentElement;
+                html.style.setProperty('--color-picked-user', '#4579f2');
+                html.style.setProperty('--color-cheat', 'currentColor');
+            } else {
+                console.warn("Could not access the iframe");
+            }
 
-        const savedPin = (safeGetStorage(PIN_STORAGE_KEY) || '').trim();
+            const host = document.createElement('div');
+            host.id = 'wayground-host';
+            if(mainBody) { mainBody.appendChild(host); }
+            shadow = host.attachShadow({ mode: 'open' });
+            shadow.innerHTML = `
+            <style>
+                @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500&display=swap');
+                :host {
+                    --loader-size: 24px;
+                    --jump-height: -30px;
+                    --anim-dur: 1.4s;
+                    position: fixed;
+                    bottom: 10px;
+                    right: 10px;
+                    z-index: 99999;
+                    pointer-events: none;
+                }
 
-        const panelHtml = `
-            <!-- Floating Mini Restore Icon -->
-            <div id="solver-mini-icon" title="Mở bảng Wayground Tool (Alt + H)" data-wg-tool="true">
-                ⚡
-            </div>
+                .menu {
+                    fill: var(--icon-color);
+                }
 
-            <!-- Main Panel -->
-            <div id="solver-panel" data-wg-tool="true">
-                <div class="wg-panel-header">
-                    <div class="wg-panel-title-wrap">
-                        <span>⚡ Wayground Solver</span>
-                    </div>
-                    <div class="wg-panel-actions">
-                        <button id="wg-panic-btn" class="wg-header-btn" title="Boss Key / Ẩn khẩn cấp (Alt + X)">🚨</button>
-                        <button id="wg-min-btn" class="wg-header-btn" title="Thu nhỏ (Alt + H)">−</button>
-                    </div>
-                </div>
-                <div id="solver-status">Đang khởi tạo...</div>
-                <div id="key-container" style="display: none;">
-                    <div class="wg-input-row">
-                        <input type="text" id="key-input" placeholder="Nhập API Key..." value="${currentApiKey}">
-                        <button id="save-key-btn">Lưu Key</button>
-                    </div>
-                    <div class="wg-key-help">
-                        Chưa có Key? <a href="https://cheatnetwork.eu/" target="_blank" rel="noopener noreferrer">Lấy API Key tại CheatNetwork ↗</a>
-                    </div>
-                </div>
-                <div id="pin-container" style="display: none;">
-                    <div class="wg-input-row">
-                        <input type="text" id="pin-input" placeholder="Nhập mã PIN phòng..." value="${savedPin}">
-                        <button id="load-btn">Tải</button>
-                    </div>
-                    <div id="pin-cancel-row" style="display: none; justify-content: flex-end; margin-top: 2px;">
-                        <button id="cancel-pin-btn" type="button" style="background: none; border: none; color: #94a3b8; font-size: 11px; cursor: pointer; text-decoration: underline; padding: 2px 4px;">◀ Quay lại bảng điều khiển</button>
-                    </div>
-                </div>
-                <div id="settings-container" class="wg-settings-box" style="display: none;">
-                    <label class="wg-checkbox-row">
-                        <span>Tự động chọn đáp án</span>
-                        <input type="checkbox" id="wg-auto-chk" ${config.autoSelect ? 'checked' : ''}>
-                    </label>
-                    <label class="wg-checkbox-row" title="Tự động bấm Next/Tiếp theo sau khi chọn xong đáp án">
-                        <span>Tự chuyển câu (Next)</span>
-                        <input type="checkbox" id="wg-autonext-chk" ${config.autoNext ? 'checked' : ''}>
-                    </label>
-                    <div class="wg-speed-row">
-                        <span>Tốc độ chọn:</span>
-                        <div class="wg-stepper-wrap">
-                            <button id="wg-speed-minus-btn" class="wg-step-btn" title="Giảm 0.5s">−</button>
-                            <div style="display: flex; align-items: center; gap: 2px;">
-                                <input type="number" id="wg-speed-input" class="wg-number-input" min="0.2" max="30" step="0.5" value="${config.baseSpeed}">
-                                <span style="font-size: 11px; color: #94a3b8;">s</span>
-                            </div>
-                            <button id="wg-speed-plus-btn" class="wg-step-btn" title="Tăng 0.5s">+</button>
+                .main {
+                    --secondary-color: #292929;
+                    --main-color: rgba(255, 255, 255);
+                    --icon-color: #292929;
+                    display: grid;
+                    grid-template-columns: repeat(12, 1fr);
+                    gap: 0;
+                    width: 280px;
+                    align-items: center;
+                    justify-content: center;
+                    transition: gap 0.4s ease-in-out;
+                    pointer-events: none;
+                    position: relative;
+                }
+
+                .text {
+                    opacity: 0;
+                    transition: 0.2s ease-in-out;
+                    font-family: "Poppins", sans-serif;
+                    font-weight: 500;
+                    font-size: 16px;
+                    color: var(--secondary-color);
+                    margin: 0;
+                }
+
+                .subtextT {
+                    transition: 0.2s ease-in-out;
+                    color: var(--secondary-color);
+                    margin: 0;
+                    font-size: 12px;
+                    opacity: 0;
+                    font-family: 'Poppins', sans-serif;
+                }
+
+                .subtext {
+                    transition: 0.2s ease-in-out;
+                    color: var(--secondary-color);
+                    margin: 0;
+                    font-size: 12px;
+                    opacity: 0.6;
+                    font-family: 'Poppins', sans-serif;
+                }
+
+                .main_back {
+                    position: absolute;
+                    justify-self: center;
+                    transition: 0.2s ease-in-out, 0.1s background-color ease-in-out, 0.1s background-image ease-in-out;
+                }
+
+                .cardBa {
+                    display: flex;
+                    background: transparent;
+                    align-items: center;
+                    justify-content: center;
+                    width: 60px;
+                    height: 60px;
+                    backdrop-filter: blur(5px);
+                    -webkit-backdrop-filter: blur(5px);
+                    border-radius: 10px;
+                    pointer-events: auto;
+                }
+
+                .card, .card-track {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    width: 70px;
+                    height: 70px;
+                    border-top-left-radius: 10px;
+                    border: 1px solid transparent;
+                    gap: 3px;
+                    will-change: transform;
+                    transition: transform 0.3s cubic-bezier(0.25, 1, 0.5, 1), background-color 0.2s ease-in-out, background-color 0.2s ease, background-image 0.2s ease-in-out;
+                }
+
+                .card-track:hover {
+                    background-color: var(--secondary-color);
+                    box-shadow: 0px 10px 20px rgba(0, 0, 0, 0.2);
+                }
+
+                .card-track:hover .text {
+                    color: var(--main-color) !important;
+                }
+
+                .card .title {
+                    opacity: 0;
+                    transition: 0.2s ease-in-out;
+                    background: #f5e642;
+                }
+
+                .card:nth-child(1) {
+                    grid-column: span 12;
+                    width: 100%;
+                }
+
+                .card:nth-child(2) {
+                    grid-column: span 7;
+                    width: 100%;
+                    flex-direction: column;
+                    border-radius: 0px;
+                }
+
+                .card:nth-child(3) {
+                    grid-column: span 5;
+                    width: 100%;
+                    flex-direction: column;
+                    border-radius: 0px;
+                }
+
+                .card:nth-child(3) .shield {
+                    opacity: 0;
+                    transition: 0.2s ease-in-out;
+                    fill: var(--secondary-color);
+                }
+
+                .card:nth-child(4) {
+                    grid-column: span 6;
+                    width: 100%;
+                    flex-direction: column;
+                    border-radius: 0px;
+                }
+
+                .card:nth-child(4) .toggleAns {
+                    opacity: 0;
+                    transition: 0.2s ease-in-out;
+                    fill: var(--secondary-color);
+                }
+
+                .card:nth-child(5) {
+                    grid-column: span 6;
+                    width: 100%;
+                    flex-direction: column;
+                    border-radius: 0px;
+                }
+
+                .card:nth-child(5) .toggleAns {
+                    opacity: 0;
+                    transition: 0.2s ease-in-out;
+                    fill: var(--secondary-color);
+                }
+
+                .card:nth-child(6) {
+                    grid-column: span 4;
+                    width: 100%;
+                    border-radius: 0px;
+                    border-bottom-left-radius: 10px;
+                }
+
+                .card:nth-child(6) .greasy {
+                    opacity: 0;
+                    transition: 0.2s ease-in-out;
+                    fill: var(--secondary-color);
+                }
+
+                .card:nth-child(7) {
+                    grid-column: span 4;
+                    width: 100%;
+                    border-radius: 0px;
+                }
+
+                .card:nth-child(7) .github {
+                    opacity: 0;
+                    transition: 0.2s ease-in-out;
+                    fill: var(--secondary-color);
+                }
+
+                .card:nth-child(8) {
+                    grid-column: span 4;
+                    width: 100%;
+                    border-radius: 0px;
+                    border-bottom-right-radius: 10px;
+                }
+
+                .card:nth-child(8) .settings {
+                    opacity: 0;
+                    transition: 0.2s ease-in-out;
+                    fill: var(--secondary-color);
+                }
+
+
+                .main:hover {
+                    gap: 0.4em;
+                    cursor: pointer;
+                    pointer-events: auto;
+                }
+
+                .main:hover .words { opacity: 1; }
+                .main:hover .text { opacity: 1; }
+                .main:hover .subtextT { opacity: 0.6; }
+                .main:hover .main_back { opacity: 0;display: none; }
+                .main:hover .menu { opacity: 0; display: none; }
+                .main:hover .card {
+                    margin: 0;
+                    border-radius: 10px;
+                    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+                    border: 1px solid rgba(255, 255, 255, 0.3);
+                    background: var(--main-color);
+                }
+
+                .main:hover .card:nth-child(8) { border: transparent; }
+                .main:hover .title { opacity: 1; }
+                .main:hover .shield { opacity: 1; }
+                .main:hover .toggleAns { opacity: 1; }
+                .main:hover .greasy { opacity: 1; }
+                .main:hover .github { opacity: 1; }
+                .main:hover .settings { opacity: 1; }
+                .card:hover {
+                    transform: scale(1.02);
+                }
+
+                .card:nth-child(1):hover {
+                    border-bottom: 5px solid #0a0a0a;
+                    position: relative;
+                    overflow: hidden;
+                    display: flex;
+                    align-items: center;
+                    background-color: #f5e642;
+                    background-image: repeating-linear-gradient(45deg, transparent 0px, transparent 8px, rgba(0, 0, 0, 0.12) 8px, rgba(0, 0, 0, 0.12) 10px);
+                }
+
+                .card:nth-child(1):hover .text { color: #292929; }
+                .card:nth-child(2):hover { border-bottom: 5px solid #0a0a0a; background: #adb5bd; cursor: pointer; }
+                .card:nth-child(2):hover .text { color: #292929; }
+                .card:nth-child(3):hover { border-bottom: 5px solid #0a0a0a; background: #adb5bd; }
+                .card:nth-child(3):hover .text { color: #292929; }
+                .card:nth-child(3):hover .shield { fill: var(--secondary-color); }
+                .card:nth-child(4):hover { border-bottom: 5px solid #0a0a0a; background: #adb5bd; }
+                .card:nth-child(4):hover .text { color: #292929; }
+                .card:nth-child(4):hover .toggleAns { fill: #292929; }
+                .card:nth-child(5):hover { border-bottom: 5px solid #0a0a0a; background: #adb5bd; }
+                .card:nth-child(5):hover .text { color: #292929; }
+                .card:nth-child(5):hover .toggleAns { fill: #292929; }
+                .card:nth-child(6):hover { border-bottom: 5px solid #0a0a0a; background-color: var(--secondary-color); }
+                .card:nth-child(6):hover .greasy { fill: var(--main-color); }
+                .card:nth-child(6):hover .svgIcon { transform: rotate(250deg); transition-duration: 1.5s; }
+                .card:nth-child(7):hover { border-bottom: 5px solid #0a0a0a; background-color: var(--secondary-color); }
+                .card:nth-child(7):hover .github { fill: var(--main-color); }
+                .card:nth-child(7):hover .text { color: var(--main-color); }
+                .card:nth-child(8):hover { border-bottom: 5px solid #0a0a0a; background-color: var(--secondary-color); }
+                .card:nth-child(8):hover .settings { fill: var(--main-color); }
+                .card:nth-child(8) > svg { animation: spin 4s linear infinite; transform-origin: center; }
+
+                .loader-container {
+                    position: relative;
+                    width: var(--loader-size);
+                    height: var(--loader-size);
+                }
+
+                .loader-shadow {
+                    position: absolute;
+                    bottom: -6px;
+                    left: calc(var(--loader-size) * -0.2);
+                    width: calc(var(--loader-size) * 1.4);
+                    height: 4px;
+                    background: rgba(0, 0, 0, 0.15);
+                    border-radius: 50%;
+                    animation: shadowScale var(--anim-dur) infinite;
+                    transform-origin: center center;
+                }
+
+                .loader-box-wrap {
+                    position: absolute;
+                    bottom: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    transform-origin: bottom center;
+                    animation: squash var(--anim-dur) infinite;
+                }
+
+                .loader-box {
+                    width: 100%;
+                    height: 100%;
+                    animation: jumpRotate var(--anim-dur) infinite;
+                    transform-origin: center center;
+                }
+
+                .loader-box svg {
+                    width: 100%;
+                    height: 100%;
+                    display: block;
+                }
+
+                @keyframes squash {
+                    0% { transform: scaleX(1.05) scaleY(0.95); animation-timing-function: ease-in-out; }
+                    15% { transform: scaleX(0.95) scaleY(1.05); animation-timing-function: ease-out; }
+                    50% { transform: scaleX(1) scaleY(1); animation-timing-function: ease-in; }
+                    84.9% { transform: scaleX(0.95) scaleY(1.05); }
+                    85% { transform: scaleX(1.15) scaleY(0.85); animation-timing-function: ease-in-out; }
+                    100% { transform: scaleX(1.05) scaleY(0.95); }
+                }
+
+                @keyframes jumpRotate {
+                    0% { transform: translateY(0) rotate(0deg); animation-timing-function: ease-in-out; }
+                    15% { transform: translateY(0) rotate(0deg); animation-timing-function: ease-out; }
+                    50% { transform: translateY(var(--jump-height)) rotate(45deg); animation-timing-function: ease-in; }
+                    84.9% { transform: translateY(0) rotate(90deg); }
+                    85% { transform: translateY(0) rotate(90deg); animation-timing-function: ease-in-out; }
+                    100% { transform: translateY(0) rotate(90deg); }
+                }
+
+                @keyframes shadowScale {
+                    0% { transform: scaleX(1.05); opacity: 0.15; animation-timing-function: ease-in-out; }
+                    15% { transform: scaleX(0.9); opacity: 0.1; animation-timing-function: ease-out; }
+                    50% { transform: scaleX(0.5); opacity: 0.05; animation-timing-function: ease-in; }
+                    84.9% { transform: scaleX(0.9); opacity: 0.1; }
+                    85% { transform: scaleX(1.15); opacity: 0.2; animation-timing-function: ease-in-out; }
+                    100% { transform: scaleX(1.05); opacity: 0.15; }
+                }
+
+                @keyframes spin {
+                    from { transform: rotate(0deg); }
+                    to { transform: rotate(360deg); }
+                }
+
+                #pause { display: none; }
+
+                .words {
+                    display: inline-block;
+                    opacity: 0;
+                    height: 1.5em;
+                    overflow: hidden;
+                    position: relative;
+                }
+
+                .word {
+                    display: flex;
+                    align-items: center;
+                    height: 100%;
+                    padding-left: 6px;
+                    color: #956afa;
+                    animation: spin_words 4s infinite ease-in-out;
+                }
+
+                @keyframes spin_words {
+                    20% { transform: translateY(-102%); }
+                    33% { transform: translateY(-100%); }
+                    53% { transform: translateY(-202%); }
+                    66% { transform: translateY(-200%); }
+                    86% { transform: translateY(-302%); }
+                    100% { transform: translateY(-300%); }
+                }
+
+                .switch {
+                    font-size: 17px;
+                    position: relative;
+                    display: inline-block;
+                    width: 40px;
+                    height: 22px;
+                    opacity: 0;
+                }
+
+                .main:hover .switch {
+                    opacity: 1;
+                }
+
+                .switch input {
+                    opacity: 0;
+                    width: 0;
+                    height: 0;
+                }
+
+                .slider {
+                    position: absolute;
+                    cursor: pointer;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    bottom: 0;
+                    background-color: #fff;
+                    border: 1px solid #adb5bd;
+                    transition: .4s;
+                    border-radius: 22px;
+                }
+
+                .slider:before {
+                    position: absolute;
+                    content: "";
+                    height: 16px;
+                    width: 16px;
+                    border-radius: 50%;
+                    left: 2px;
+                    bottom: 2px;
+                    background-color: #adb5bd;
+                    transition: .4s;
+                }
+
+                input:checked + .slider {
+                    background-color: #39be44;
+                    border: 1px solid #39be44;
+                }
+
+                input:focus + .slider {
+                    box-shadow: 0 0 1px #39be44;
+                }
+
+                input:checked + .slider:before {
+                    transform: translateX(18px);
+                    background-color: #fff;
+                }
+
+                .settings_menu, .terms_menu, .apikey_menu, .answers_menu {
+                    position: absolute;
+                    bottom: 0;
+                    left: 0;
+                    width: 100%;
+                    min-height: 100%;
+                    height: max-content;
+                    background: var(--main-color);
+                    border-radius: 10px;
+                    border: 1px solid rgba(255, 255, 255, 0.3);
+                    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+                    backdrop-filter: blur(5px);
+                    -webkit-backdrop-filter: blur(5px);
+                    filter: blur(0px);
+
+                    opacity: 0;
+                    filter: blur(10px);
+                    pointer-events: none;
+                    visibility: hidden;
+                    max-height: 100%;
+                    overflow: hidden;
+                    transition: opacity 0.3s ease-in-out, filter 0.3s ease-in-out, max-height 0.6s ease-in-out, visibility 0.3s;
+
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: flex-start;
+                    padding: 20px;
+                    box-sizing: border-box;
+                    z-index: 100;
+                    gap: 15px;
+                }
+
+                .settings-item {
+                    border-radius: 8px; border: 1px solid rgba(150, 150, 150, 0.2);
+                    padding: 10px 15px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    width: 100%;
+                    box-sizing: border-box;
+                }
+
+                #close-settings, #close-terms, #close-apikey, #close-answers {
+                    cursor: pointer;
+                    fill: var(--secondary-color);
+                    transition: transform 0.2s;
+                }
+
+                #close-settings:hover, #close-terms:hover, #close-apikey:hover, #close-answers:hover {
+                    transform: scale(1.2);
+                }
+
+                .settings_menu.open, .terms_menu.open, .apikey_menu.open, .answers_menu.open {
+                    opacity: 1;
+                    filter: blur(0px);
+                    max-height: 600px;
+                    pointer-events: auto;
+                    visibility: visible;
+                    border-bottom: 5px solid #0a0a0a;
+                    background-color: var(--main-color);
+                }
+
+                .settings_menu.open > div:first-child > .text, .terms_menu.open > div:first-child > .text, .apikey_menu.open > div:first-child > .text, .answers_menu.open > div:first-child > .text {
+                    color: var(--secondary-color);
+                }
+
+                .settings_menu.open > div:first-child > #close-settings, .terms_menu.open > div:first-child > #close-terms, .apikey_menu.open > div:first-child > #close-apikey, .answers_menu.open > div:first-child > #close-answers {
+                    fill: var(--secondary-color);
+                }
+
+                .settings_menu .settings-item .text, .answers_menu .settings-item .text {
+                    color: var(--secondary-color) !important;
+                }
+
+                .main:has(.settings_menu.open, .terms_menu.open, .apikey_menu.open, .answers_menu.open) .card {
+                    filter: blur(8px) !important;
+                    pointer-events: none !important;
+                    transition: filter 0.3s ease-in-out;
+                }
+
+                .menu-header {
+                    width: 100%; display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;
+                }
+
+                .menu-title-wrapper {
+                    display: flex; align-items: baseline; gap: 8px;
+                }
+
+                .menu-title {
+                    opacity: 1; margin: 0; font-size: 18px; font-weight: bold;
+                }
+
+                .badge-version {
+                    font-size: 11px; background: #4579f2; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-family: 'Poppins', sans-serif;
+                }
+
+                .settings-item-col {
+                    display: flex; flex-direction: column; flex: 1; min-width: 0; padding-right: 10px;
+                }
+
+                .settings-item-title {
+                    opacity: 1; font-size: 14px; color: var(--secondary-color);
+                }
+
+                .color-picker-input {
+                    width: 40px; height: 22px; border: none; border-radius: 4px; cursor: pointer;
+                }
+
+                .btn-outline {
+                    width: 90%; height: 40px; margin: 10px auto 0 auto; border-radius: 8px; border: 1px solid rgba(150, 150, 150, 0.2); cursor: pointer;
+                }
+
+                .btn-outline .text {
+                    opacity: 1; font-size: 13px; font-weight: bold; color: var(--secondary-color); transition: color 0.2s ease;
+                }
+
+                .terms-content {
+                    overflow-y: auto; max-height: 400px; font-size: 12px; color: var(--secondary-color); font-family: 'Poppins', sans-serif; text-align: left; padding-right: 5px;
+                }
+
+                #answers-list {
+                scrollbar-width: none;
+                -ms-overflow-style: none;
+                }
+
+                #answers-list::-webkit-scrollbar {
+                display: none;
+                }
+            </style>
+
+            <div class="main">
+                <div class="card card-wide title">
+                    <div style="display: flex; align-items: center;">
+                    <p class="text">Wayground Cheat</p>
+                        <div class="words">
+                            <span class="word text">auto</span>
+                            <span class="word text">simple</span>
+                            <span class="word text">easy</span>
+                            <span class="word text" aria-hidden="true">auto</span>
                         </div>
                     </div>
-                    <label class="wg-checkbox-row">
-                        <span>Ngẫu nhiên thời gian (±20%)</span>
-                        <input type="checkbox" id="wg-rand-chk" ${config.randomize ? 'checked' : ''}>
-                    </label>
-                    <label class="wg-checkbox-row" title="Tự động thêm thời gian dựa theo độ dài câu để mô phỏng người thật">
-                        <span>Giả lập đọc đề (câu dài thêm giờ)</span>
-                        <input type="checkbox" id="wg-dynamic-chk" ${config.dynamicPacing ? 'checked' : ''}>
-                    </label>
-                    <div class="wg-select-row">
-                        <span>Kiểu highlight:</span>
-                        <select id="wg-stealth-select" class="wg-select-input">
-                            <option value="ghost" ${config.stealthLevel === 'ghost' ? 'selected' : ''}>👻 Siêu kín đáo (Chỉ bạn biết)</option>
-                            <option value="subtle" ${config.stealthLevel === 'subtle' ? 'selected' : ''}>🌿 Mờ nhẹ thanh lịch</option>
-                            <option value="standard" ${config.stealthLevel === 'standard' ? 'selected' : ''}>👁️ Viền rõ ràng</option>
-                        </select>
+                </div>
+
+                <div id="btn-answers" class="card" style="text-align: center;">
+                    <p class="text" id="quiz-name-display" style="font-size: 14px;">${QUIZ_NAME}</p>
+                    <p class="subtextT" id="quiz-status-display">Searching answers...</p>
+                </div>
+
+                <div id="card-anticheat" class="card">
+                    <p class="text" style="margin-left: 5px; font-size: 14px;">Anti-Cheat</p>
+                    <svg class="shield" xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="#1f1f1f"><path d="m438-338 226-226-57-57-169 169-84-84-57 57 141 141Zm42 258q-139-35-229.5-159.5T160-516v-244l320-120 320 120v244q0 152-90.5 276.5T480-80Zm0-84q104-33 172-132t68-220v-189l-240-90-240 90v189q0 121 68 220t172 132Zm0-316Z"/></svg>
+                    <p class="subtextT" id="anticheat-status-display" style="color: #39be44;">Safe</p>
+                </div>
+
+                <div id="toggleAns" class="card">
+                    <p class="text" style="margin-left: 5px;">Show Answers</p>
+                    <label class="switch">
+                        <input type="checkbox" checked>
+                        <span class="slider"></span>
+                        </label>
+                </div>
+
+                <div id="btn-apikey" class="card" style="position: relative;">
+                    <p class="text" style="margin-left: 5px;">Api key</p>
+                    <p class="subtextT"> click for configuration</p>
+                    <div id="main-ai-indicator" style="position: absolute; top: 12px; right: 15px; width: 8px; height: 8px; border-radius: 50%; background-color: gray; box-shadow: 0 0 5px gray;" title="AI is disabled"></div>
+                </div>
+
+                <a id="greasy" href="https://greasyfork.org/es/users/1600509-byoscarpine" class="card" target="_blank" rel="noopener noreferrer">
+                    <svg class="greasy" height="30px" width="30px" role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M5.89 2.227a.28.28 0 0 1 .266.076l5.063 5.062c.54.54.509 1.652-.031 2.192l8.771 8.77c1.356 1.355-.36 3.097-1.73 1.728l-8.772-8.77c-.54.54-1.651.571-2.191.031l-5.063-5.06c-.304-.304.304-.911.608-.608l3.714 3.713L7.59 8.297 3.875 4.582c-.304-.304.304-.911.607-.607l3.715 3.714 1.067-1.066L5.549 2.91c-.228-.228.057-.626.342-.683ZM12 0C5.374 0 0 5.375 0 12s5.374 12 12 12c6.625 0 12-5.375 12-12S18.625 0 12 0Z"/>
+                    </svg>
+                </a>
+
+                <a id="github" href="https://github.com/ByOscarPINE" class="card" target="_blank" rel="noopener noreferrer">
+                    <svg height="30px" width="30px" viewBox="0 0 30 30" xmlns="http://www.w3.org/2000/svg" class="github">
+                        <path d="M15,3C8.373,3,3,8.373,3,15c0,5.623,3.872,10.328,9.092,11.63C12.036,26.468,12,26.28,12,26.047v-2.051 c-0.487,0-1.303,0-1.508,0c-0.821,0-1.551-0.353-1.905-1.009c-0.393-0.729-0.461-1.844-1.435-2.526 c-0.289-0.227-0.069-0.486,0.264-0.451c0.615,0.174,1.125,0.596,1.605,1.222c0.478,0.627,0.703,0.769,1.596,0.769 c0.433,0,1.081-0.025,1.691-0.121c0.328-0.833,0.895-1.6,1.588-1.962c-3.996-0.411-5.903-2.399-5.903-5.098 c0-1.162,0.495-2.286,1.336-3.233C9.053,10.647,8.706,8.73,9.435,8c1.798,0,2.885,1.166,3.146,1.481C13.477,9.174,14.461,9,15.495,9 c1.036,0,2.024,0.174,2.922,0.483C18.675,9.17,19.763,8,21.565,8c0.732,0.731,0.381,2.656,0.102,3.594 c0.836,0.945,1.328,2.066,1.328,3.226c0,2.697-1.904,4.684-5.894,5.097C18.199,20.49,19,22.1,19,23.313v2.734 c0,0.104-0.023,0.179-0.035,0.268C23.641,24.676,27,20.236,27,15C27,8.373,21.627,3,15,3z"></path>
+                    </svg>
+                </a>
+
+                <div id="config" class="card">
+                    <svg class="settings" xmlns="http://www.w3.org/2000/svg" height="30px" viewBox="0 -960 960 960" width="24px" fill="#1f1f1f"><path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-2 13.5l103 78-110 190-118-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 42q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 64q-5 15-7 30t-2 32q0 16 2 31t7 30l-86 65 39 68 99-42q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/></svg>
+                </div>
+
+                <div class="settings_menu">
+                    <div class="menu-header">
+                        <div class="menu-title-wrapper">
+                            <p class="text menu-title">Settings</p>
+                            <span id="script-version" class="badge-version">VERSION 1.0.0</span>
+                        </div>
+                        <svg id="close-settings" xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>
                     </div>
-                    <div class="wg-nav-row">
-                        <button id="wg-prev-btn" class="wg-chip-btn" style="flex: 1;" title="Câu trước (Alt + ←)">◀ Trước</button>
-                        <button id="wg-autofill-btn" class="wg-chip-btn wg-chip-primary" style="flex: 1.4;" title="Tự động giải và duyệt qua tất cả các câu hỏi">🚀 Giải Cả Đề</button>
-                        <button id="wg-next-btn" class="wg-chip-btn" style="flex: 1;" title="Câu sau (Alt + →)">Tiếp ▶</button>
+
+                    <div id="btn-apikeyconfig" class="settings-item">
+                        <div class="settings-item-col">
+                            <span class="text settings-item-title">Api Key</span>
+                            <span class="subtext">Enter your API key</span>
+                        </div>
                     </div>
-                    <button id="wg-cheatsheet-btn" class="wg-sheet-btn" style="display: none;">📋 Xem Toàn Bộ Đáp Án</button>
-                    <div class="wg-action-btn-row" style="display: flex; gap: 6px; margin-top: 4px;">
-                        <button id="change-pin-btn" class="wg-sec-btn" style="flex: 1;" title="Nhập mã phòng khác">🎮 Đổi Mã Phòng</button>
-                        <button id="change-key-btn" class="wg-sec-btn" style="flex: 1;" title="Đổi API Key khác">🔑 Đổi Key</button>
+
+                    <div id="dark-mode" class="settings-item">
+                        <div class="settings-item-col">
+                            <span class="text settings-item-title">Dark Mode</span>
+                            <span class="subtext">Force the dark theme.</span>
+                        </div>
+                        <label class="switch" style="opacity: 1;">
+                            <input type="checkbox">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="settings-item">
+                        <div class="settings-item-col">
+                            <span class="text settings-item-title">Answer Color</span>
+                            <span class="subtext">Choose a custom color.</span>
+                        </div>
+                        <input id="color-picker" class="color-picker-input" type="color" value="#4579f2">
+                    </div>
+
+                    <div id="btn-terms" class="card-track btn-outline">
+                        <span class="text">Terms & Conditions</span>
+                    </div>
+                </div>
+
+                <div class="terms_menu">
+                    <div class="menu-header">
+                        <p class="text menu-title">Terms & Conditions</p>
+                        <svg id="close-terms" xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>
+                    </div>
+                    <div class="terms-content">
+                        <p><strong>1. Educational Use:</strong> This script is a proof of concept for research purposes only.</p>
+                        <p><strong>2. No Warranty:</strong> It is provided "as is", without any warranty of any kind.</p>
+                        <p><strong>3. Privacy:</strong> No user information is stored or transmitted to external servers. Everything works entirely locally.</p>
+                        <p><strong>4. Liability:</strong> The user assumes all risks associated with the use of this script.</p>
+                    </div>
+                </div>
+
+                <div class="apikey_menu">
+                    <div class="menu-header">
+                        <p class="text menu-title">API Key</p>
+                        <svg id="close-apikey" xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>
+                    </div>
+                    <div class="apikey-content" style="width: 100%; box-sizing: border-box; overflow-y: auto; max-height: 400px; padding-right: 5px;">
+                        <div class="settings-item" style="margin-bottom: 10px;">
+                            <div class="settings-item-col">
+                                <span class="text settings-item-title" style="color: var(--secondary-color) !important;">Enable AI</span>
+                                <span class="subtext">Turn AI assistance on/off. Note: AI can make mistakes.</span>
+                            </div>
+                            <label class="switch" style="opacity: 1;">
+                                <input type="checkbox" id="toggle-ai-checkbox">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <div class="settings-item" style="flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 10px;">
+                            <div class="settings-item-col" style="width: 100%;">
+                                <span class="text settings-item-title" style="color: var(--secondary-color) !important;">API Provider</span>
+                                <span class="subtext">Select your AI provider</span>
+                            </div>
+                            <select id="api-provider-select" style="width: 100%; padding: 8px; border-radius: 5px; border: 1px solid rgba(150, 150, 150, 0.2); background: transparent; color: var(--secondary-color); box-sizing: border-box; outline: none;">
+                                <option value="agnes" style="color: #000;">Agnes (Free)</option>
+                                <option value="gemini" style="color: #000;">Gemini (Google)</option>
+                                <option value="gpt" style="color: #000;">GPT (OpenAI)</option>
+                            </select>
+                        </div>
+
+                        <div class="settings-item" style="flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 10px;">
+                            <div class="settings-item-col">
+                                <span class="text settings-item-title" style="color: var(--secondary-color) !important;">Api Key</span>
+                                <span class="subtext">Enter your API key below:</span>
+                                <span class="subtext">100% client-side storage. Your key is never shared or uploaded.</span>
+                            </div>
+                            <input type="text" id="apikey-input" placeholder="Your API Key" style="width: 100%; padding: 8px; border-radius: 5px; border: 1px solid rgba(150, 150, 150, 0.2); background: transparent; color: var(--secondary-color); box-sizing: border-box; outline: none;">
+                        </div>
+
+                        <div class="settings-item" style="flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 15px;">
+                            <button id="test-api-btn" style="padding: 8px 15px; border-radius: 5px; border: 1px solid var(--secondary-color); background: transparent; color: var(--secondary-color); cursor: pointer; font-weight: bold; transition: 0.2s;">
+                                Test API
+                            </button>
+                            <div id="api-status" style="display: flex; align-items: center; gap: 5px;">
+                                <div style="width: 10px; height: 10px; border-radius: 50%; background-color: gray;" id="api-status-dot"></div>
+                                <span class="subtext" id="api-status-text" style="color: var(--secondary-color) !important;">Not tested</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="answers_menu">
+                    <div class="menu-header">
+                        <p class="text menu-title">Answers</p>
+                        <svg id="close-answers" xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>
+                    </div>
+                    <div style="margin-bottom: 10px; width: 100%;">
+                        <input
+                            type="text"
+                            id="search-input"
+                            placeholder="Buscar pregunta o respuesta..."
+                            style="width: 100%; padding: 6px 10px; box-sizing: border-box; border: 1px solid #444; border-radius: 4px; background: var(--main-color); color: var(--secondary-color); font-size: 13px;"
+                        />
+                    </div>
+
+                    <div class="answers-content" id="answers-list" style="width: 100%; box-sizing: border-box; overflow-y: auto; max-height: 400px; scrollbar-width: none; aspect-ratio: 1 / 2;">
+                        <p class="subtext" style="text-align: center; ">No answers found yet.</p>
+                    </div>
+                </div>
+
+                <div class="main_back">
+                    <div class="cardBa">
+                        <div class="loader-container">
+                            <div class="loader-shadow"></div>
+                            <div class="loader-box-wrap">
+                                <div class="loader-box">
+                                    <svg class="menu" xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="#1f1f1f"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h560q33 0 56.5 23.5T840-760v560q0 33-23.5 56.5T760-120H200Zm0-80h560v-560H200v560Z"/></svg>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
+            `;
 
-            <!-- Quiz Cheatsheet Modal -->
-            <div id="wg-cheatsheet-modal" class="wg-modal-overlay" style="display: none;" data-wg-tool="true">
-                <div class="wg-modal-card">
-                    <div class="wg-modal-header">
-                        <span class="wg-modal-title">📋 Toàn Bộ Đáp Án Đề Thi</span>
-                        <button id="wg-close-sheet-btn" class="wg-header-btn">✕</button>
-                    </div>
-                    <input type="text" id="wg-sheet-search" class="wg-search-input" placeholder="🔍 Tìm câu hỏi / đáp án...">
-                    <div id="wg-sheet-list" class="wg-sheet-content"></div>
-                </div>
-            </div>
-        `;
-        document.body.insertAdjacentHTML('beforeend', panelHtml);
+            const searchInput = shadow.querySelector('#search-input');
+            const answersList = shadow.querySelector('#answers-list');
 
-        const panel = document.getElementById('solver-panel');
-        const miniIcon = document.getElementById('solver-mini-icon');
-        const minBtn = document.getElementById('wg-min-btn');
-        const panicBtn = document.getElementById('wg-panic-btn');
-        const status = document.getElementById('solver-status');
-        const keyContainer = document.getElementById('key-container');
-        const pinContainer = document.getElementById('pin-container');
-        const settingsContainer = document.getElementById('settings-container');
-        const keyInput = document.getElementById('key-input');
-        const saveKeyBtn = document.getElementById('save-key-btn');
-        const pinInput = document.getElementById('pin-input');
-        const loadBtn = document.getElementById('load-btn');
-        const changePinBtn = document.getElementById('change-pin-btn');
-        const cancelPinBtn = document.getElementById('cancel-pin-btn');
-        const changeKeyBtn = document.getElementById('change-key-btn');
-        const autoChk = document.getElementById('wg-auto-chk');
-        const autoNextChk = document.getElementById('wg-autonext-chk');
-        const prevBtn = document.getElementById('wg-prev-btn');
-        const nextBtn = document.getElementById('wg-next-btn');
-        const autofillBtn = document.getElementById('wg-autofill-btn');
-        const speedInput = document.getElementById('wg-speed-input');
-        const speedMinusBtn = document.getElementById('wg-speed-minus-btn');
-        const speedPlusBtn = document.getElementById('wg-speed-plus-btn');
-        const randChk = document.getElementById('wg-rand-chk');
-        const dynamicChk = document.getElementById('wg-dynamic-chk');
-        const stealthSelect = document.getElementById('wg-stealth-select');
-        const cheatsheetBtn = document.getElementById('wg-cheatsheet-btn');
-        const cheatsheetModal = document.getElementById('wg-cheatsheet-modal');
-        const closeSheetBtn = document.getElementById('wg-close-sheet-btn');
-        const sheetSearch = document.getElementById('wg-sheet-search');
-        const sheetList = document.getElementById('wg-sheet-list');
-        const panelHeader = panel.querySelector('.wg-panel-header');
+            if (searchInput && answersList) {
+                searchInput.addEventListener('input', (e) => {
+                    const searchTerm = e.target.value.toLowerCase().trim();
+                    const items = answersList.querySelectorAll('.answer-item');
 
-        // Drag & Move logic for Mobile Touch and Desktop Mouse
-        function setupDraggable(element, handle, storageKey) {
+                    items.forEach(item => {
+                        const textContent = item.textContent.toLowerCase();
+
+                        if (textContent.includes(searchTerm)) {
+                            item.style.display = 'block';
+                        } else {
+                            item.style.display = 'none';
+                        }
+                    });
+                });
+            }
+
+            const configBtn = shadow.querySelector('#config');
+            const closeSettings = shadow.querySelector('#close-settings');
+            const settingsMenu = shadow.querySelector('.settings_menu');
+            const cards = shadow.querySelectorAll('.card, .card-track');
+            const colorPicker = shadow.querySelector('#color-picker');
+            const termsBtn = shadow.querySelector('#btn-terms');
+            const closeTerms = shadow.querySelector('#close-terms');
+            const termsMenu = shadow.querySelector('.terms_menu');
+            const apikeyBtn = shadow.querySelector('#btn-apikey');
+            const apikeyBtnconfig = shadow.querySelector('#btn-apikeyconfig');
+            const closeApikey = shadow.querySelector('#close-apikey');
+            const apikeyMenu = shadow.querySelector('.apikey_menu');
+            const btnAnswers = shadow.querySelector('#btn-answers');
+            const closeAnswers = shadow.querySelector('#close-answers');
+            const answersMenu = shadow.querySelector('.answers_menu');
+            const toggleMenu = (open) => settingsMenu?.classList.toggle('open', open);
+            const toggleTerms = (open) => termsMenu?.classList.toggle('open', open);
+            const toggleApikey = (open) => apikeyMenu?.classList.toggle('open', open);
+            const toggleAnswers = (open) => answersMenu?.classList.toggle('open', open);
+
             let isDragging = false;
-            let startX = 0, startY = 0;
-            let initialLeft = 0, initialTop = 0;
-            let didMove = false;
+            let startX, startY;
+            const dragTarget = typeof shadow !== 'undefined' && shadow.host ? shadow.host : shadow.querySelector('.main');
 
-            try {
-                const saved = safeGetStorage(storageKey);
-                if (saved) {
-                    const { x, y } = JSON.parse(saved);
-                    const maxX = Math.max(8, (window.innerWidth || 360) - element.offsetWidth - 8);
-                    const maxY = Math.max(8, (window.innerHeight || 640) - element.offsetHeight - 8);
-                    const curX = Math.min(Math.max(8, x), maxX);
-                    const curY = Math.min(Math.max(8, y), maxY);
-                    element.style.left = curX + 'px';
-                    element.style.top = curY + 'px';
-                    element.style.bottom = 'auto';
-                    element.style.right = 'auto';
-                }
-            } catch (e) {}
+            if (dragTarget && (!dragTarget.style.position || dragTarget.classList.contains('main'))) {
+                dragTarget.style.position = 'fixed';
+                dragTarget.style.bottom = '10px';
+                dragTarget.style.right = '10px';
+                dragTarget.style.zIndex = '99999';
+            }
 
-            const onPointerDown = (e) => {
-                if (e.button && e.button !== 0) return;
-                if (e.target.closest('button, input, a, label, select')) return;
+            let initialRight, initialBottom;
 
-                isDragging = true;
-                didMove = false;
+            dragTarget?.addEventListener('mousedown', (e) => {
+                if (e.target.closest('.settings_menu, .terms_menu, .apikey_menu, input, label, a')) return;
+
                 startX = e.clientX;
                 startY = e.clientY;
 
-                const rect = element.getBoundingClientRect();
-                initialLeft = rect.left;
-                initialTop = rect.top;
+                const computed = window.getComputedStyle(dragTarget);
+                initialRight = parseInt(computed.right) || 0;
+                initialBottom = parseInt(computed.bottom) || 0;
+
+                function onMouseMove(moveEvent) {
+                    const dx = startX - moveEvent.clientX;
+                    const dy = startY - moveEvent.clientY;
+
+                    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+                        isDragging = true;
+                        dragTarget.style.right = (initialRight + dx) + 'px';
+                        dragTarget.style.bottom = (initialBottom + dy) + 'px';
+                        dragTarget.style.cursor = 'grabbing';
+                    }
+                }
+
+                function onMouseUp() {
+                    document.removeEventListener('mousemove', onMouseMove);
+                    document.removeEventListener('mouseup', onMouseUp);
+                    dragTarget.style.cursor = '';
+                    setTimeout(() => { isDragging = false; }, 50);
+                }
+
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            });
+
+            dragTarget?.addEventListener('click', (e) => {
+                if (isDragging) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+            }, true);
+
+            configBtn?.addEventListener('click', () => {
+                toggleTerms(false);
+                toggleApikey(false);
+                toggleAnswers(false);
+                toggleMenu(true);
+            });
+            closeSettings?.addEventListener('click', () => toggleMenu(false));
+            settingsMenu?.addEventListener('mouseleave', () => toggleMenu(false));
+            termsBtn?.addEventListener('click', () => {
+                toggleMenu(false);
+                toggleApikey(false);
+                toggleAnswers(false);
+                toggleTerms(true);
+            });
+            closeTerms?.addEventListener('click', () => toggleTerms(false));
+            termsMenu?.addEventListener('mouseleave', () => toggleTerms(false));
+
+            apikeyBtn?.addEventListener('click', () => {
+                toggleMenu(false);
+                toggleTerms(false);
+                toggleAnswers(false);
+                toggleApikey(true);
+            });
+            apikeyBtnconfig?.addEventListener('click', () => {
+                toggleMenu(false);
+                toggleTerms(false);
+                toggleAnswers(false);
+                toggleApikey(true);
+            });
+            closeApikey?.addEventListener('click', () => toggleApikey(false));
+            apikeyMenu?.addEventListener('mouseleave', () => toggleApikey(false));
+            btnAnswers?.addEventListener('click', () => {
+                toggleMenu(false);
+                toggleTerms(false);
+                toggleApikey(false);
+                toggleAnswers(true);
+            });
+            closeAnswers?.addEventListener('click', () => toggleAnswers(false));
+            answersMenu?.addEventListener('mouseleave', () => toggleAnswers(false));
+
+            function UpdateAnsColor() {
+                html.style.setProperty('--color-picked-user', `${colorPicker.value}`);
+                localStorage.setItem("ansColor", colorPicker.value);
+            }
+
+            const ansColorSaved = localStorage.getItem("ansColor") || '#4579f2';
+            colorPicker.value = ansColorSaved;
+            UpdateAnsColor();
+            colorPicker.oninput = UpdateAnsColor;
+
+            const main = shadow.querySelector('.main');
+            const menuIcon = shadow.querySelector('.menu');
+            const toggleAns = shadow.querySelector('#toggleAns input[type="checkbox"]');
+            const toggleAnsSub = shadow.querySelector('.subtle-answer-text');
+            const toggleAnsDark = shadow.querySelector('#dark-mode input[type="checkbox"]');
+
+            function verifyBackgroundColor() {
+                const colorBackground = window.getComputedStyle(document.querySelector('.test-theme-waiting')).backgroundColor
+                const rgb = colorBackground.match(/\d+/g);
+
+                if (rgb && rgb.length >= 3) {
+                    const r = parseInt(rgb[0]), g = parseInt(rgb[1]), b = parseInt(rgb[2]);
+                    const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+                    return brightness;
+                } else {
+                    console.log("Could not determine the background color.");
+                }
+            }
+
+            function setTheme(isDark) {
+                const props = isDark
+                    ? ['#292929', '#ffffff']
+                    : ['#ffffff', '#292929'];
+
+                main.style.setProperty('--main-color', props[0]);
+                main.style.setProperty('--secondary-color', props[1]);
+                toggleAnsDark.checked = isDark
+                const brightness = verifyBackgroundColor();
+                if(brightness < 128) {
+                    main.style.setProperty('--icon-color', '#ffffff');
+                } else {
+                    main.style.setProperty('--icon-color', '#292929');
+                }
+            }
+
+            function verifyColorMode() {
+                    const brightness = verifyBackgroundColor();
+                    setTheme(brightness < 128);
+            }
+
+            function initThemeObserver() {
+                const el = document.querySelector('.test-theme-waiting');
+                if (el) return attachDirect(el);
+
+                const finder = new MutationObserver((_, obs) => {
+                    const target = document.querySelector('.test-theme-waiting');
+                    if (target) {
+                        obs.disconnect();
+                        attachDirect(target);
+                    }
+                });
+
+                finder.observe(document.body, { childList: true, subtree: true });
+            }
+
+            function attachDirect(target) {
+                verifyColorMode();
+                new MutationObserver(() => verifyColorMode()).observe(target, {
+                    attributes: true,
+                    attributeFilter: ['style', 'class']
+                });
+            }
+
+            initThemeObserver();
+
+            cards.forEach((card) => {
+                card.addEventListener('mousemove', (e) => {
+                    const rect = card.getBoundingClientRect();
+                    const cardCenterX = rect.left + rect.width / 2;
+                    const cardCenterY = rect.top + rect.height / 2;
+
+                    const deltaX = e.clientX - cardCenterX;
+                    const deltaY = e.clientY - cardCenterY;
+
+                    const strength = 0.35;
+                    const moveX = deltaX * strength;
+                    const moveY = deltaY * strength;
+
+                    card.style.transform = `translate(${moveX}px, ${moveY}px)`;
+                });
+
+                card.addEventListener('mouseleave', () => {
+                    card.style.transform = '';
+                });
+            });
+
+            const testApiBtn = shadow.querySelector('#test-api-btn');
+            const apiStatusDot = shadow.querySelector('#api-status-dot');
+            const apiStatusText = shadow.querySelector('#api-status-text');
+            const mainStatusDot = shadow.querySelector('#main-ai-indicator');
+            const apiProvider = shadow.querySelector('#api-provider-select');
+            const apiKey = shadow.querySelector('#apikey-input');
+            const toggleAiCheckbox = shadow.querySelector('#toggle-ai-checkbox');
+
+            apiProvider.value = GM_getValue("apiProvider", "agnes");
+
+            function changeProvider() {
+                const selectedProvider = apiProvider?.value;
+                apiStatusDot.style.backgroundColor = 'gray';
+                mainStatusDot.style.backgroundColor = 'gray';
+                apiStatusText.textContent = 'Not tested';
+                switch (selectedProvider) {
+                    case "agnes":
+                        apiKey.value = GM_getValue("apiKeyAgnes", "");
+                        break;
+                    case "gemini":
+                        apiKey.value = GM_getValue("apiKeyGemini", "");
+                        break;
+                    case "gpt":
+                        apiKey.value = GM_getValue("apiKeyGpt", "");
+                        break;
+                    default:
+                        apiKey.value = "";
+                        break;
+                }
+                GM_setValue("apiProvider", selectedProvider)
+                API_KEY = apiKey.value;
+            }
+
+            function updateApiKey() {
+                API_KEY = apiKey.value.trim();
+            }
+
+            apiProvider?.addEventListener('change', changeProvider);
+            apiKey?.addEventListener('input', updateApiKey);
+            changeProvider()
+
+            async function testApi(){
+                testApiBtn.textContent = 'Testing...';
+                apiStatusDot.style.backgroundColor = 'orange';
+                apiStatusText.textContent = 'Connecting...';
+                const provider = apiProvider.value;
+                OK = false;
 
                 try {
-                    handle.setPointerCapture(e.pointerId);
-                } catch (err) {}
-            };
-
-            const onPointerMove = (e) => {
-                if (!isDragging) return;
-                const dx = e.clientX - startX;
-                const dy = e.clientY - startY;
-
-                if (!didMove && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) {
-                    didMove = true;
-                }
-
-                if (didMove) {
-                    let newX = initialLeft + dx;
-                    let newY = initialTop + dy;
-
-                    const maxX = Math.max(8, (window.innerWidth || 360) - element.offsetWidth - 8);
-                    const maxY = Math.max(8, (window.innerHeight || 640) - element.offsetHeight - 8);
-                    newX = Math.min(Math.max(8, newX), maxX);
-                    newY = Math.min(Math.max(8, newY), maxY);
-
-                    element.style.left = newX + 'px';
-                    element.style.top = newY + 'px';
-                    element.style.bottom = 'auto';
-                    element.style.right = 'auto';
-                }
-            };
-
-            const onPointerUp = (e) => {
-                if (!isDragging) return;
-                isDragging = false;
-                try {
-                    handle.releasePointerCapture(e.pointerId);
-                } catch (err) {}
-
-                if (didMove) {
-                    const rect = element.getBoundingClientRect();
-                    safeSetStorage(storageKey, JSON.stringify({ x: rect.left, y: rect.top }));
-                }
-            };
-
-            handle.addEventListener('pointerdown', onPointerDown);
-            handle.addEventListener('pointermove', onPointerMove);
-            handle.addEventListener('pointerup', onPointerUp);
-            handle.addEventListener('pointercancel', onPointerUp);
-
-            return () => didMove;
-        }
-
-        setupDraggable(panel, panelHeader, 'wg_panel_pos');
-        const miniDragMoved = setupDraggable(miniIcon, miniIcon, 'wg_mini_pos');
-
-        // Prevent tool panel clicks and typing from triggering host page listeners
-        panel.addEventListener('click', (e) => e.stopPropagation());
-        panel.addEventListener('mousedown', (e) => {
-            if (!panelHeader.contains(e.target)) {
-                e.stopPropagation();
-            }
-        });
-
-        [keyInput, pinInput, speedInput].forEach(inp => {
-            inp.addEventListener('pointerdown', (e) => e.stopPropagation());
-            inp.addEventListener('mousedown', (e) => e.stopPropagation());
-            inp.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
-        });
-
-        window.addEventListener('resize', () => {
-            [panel, miniIcon].forEach(el => {
-                if (!el || el.style.display === 'none') return;
-                const rect = el.getBoundingClientRect();
-                const maxX = Math.max(8, window.innerWidth - el.offsetWidth - 8);
-                const maxY = Math.max(8, window.innerHeight - el.offsetHeight - 8);
-                if (rect.left > maxX) el.style.left = maxX + 'px';
-                if (rect.top > maxY) el.style.top = maxY + 'px';
-            });
-        });
-
-        // Minimize / Expand logic
-        function setMinimized(minimized) {
-            config.minimized = minimized;
-            saveConfig(config);
-            if (minimized) {
-                panel.style.display = 'none';
-                miniIcon.style.display = 'flex';
-            } else {
-                panel.style.display = 'block';
-                miniIcon.style.display = 'none';
-            }
-        }
-
-        minBtn.onclick = () => setMinimized(true);
-        miniIcon.onclick = (e) => {
-            if (miniDragMoved()) {
-                e.stopPropagation();
-                return;
-            }
-            setMinimized(false);
-        };
-
-        // Hotkey Alt+H to toggle minimize/expand
-        origAddEventListener.call(targetWindow, 'keydown', (e) => {
-            if (e.altKey && (e.key === 'h' || e.key === 'H')) {
-                e.preventDefault();
-                setMinimized(!config.minimized);
-            }
-        });
-
-        // Boss Key / Panic Mode (Alt+X or 🚨)
-        let isPanicked = false;
-        let prePanicMinimized = config.minimized;
-
-        function togglePanic() {
-            isPanicked = !isPanicked;
-            let restoreSpot = document.getElementById('wg-panic-restore-spot');
-
-            if (isPanicked) {
-                prePanicMinimized = config.minimized;
-                panel.style.display = 'none';
-                miniIcon.style.display = 'none';
-                cheatsheetModal.style.display = 'none';
-                clearHighlights();
-                stopActiveTimer();
-                stopAutoFill();
-
-                if (!restoreSpot) {
-                    restoreSpot = document.createElement('div');
-                    restoreSpot.id = 'wg-panic-restore-spot';
-                    restoreSpot.style.cssText = 'position:fixed;bottom:0;left:0;width:35px;height:35px;z-index:99999999;opacity:0.001;cursor:default;';
-                    restoreSpot.setAttribute('data-wg-tool', 'true');
-                    let clickCount = 0;
-                    let clickTimer = null;
-                    restoreSpot.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        clickCount++;
-                        clearTimeout(clickTimer);
-                        clickTimer = setTimeout(() => { clickCount = 0; }, 600);
-                        if (clickCount >= 3) {
-                            togglePanic();
-                            clickCount = 0;
+                    if (provider === "agnes") {
+                        const res = await GM_xmlhttpRequestPromise(`${AGNES_BASE}/models`, 'GET', {
+                            'Authorization': `Bearer ${API_KEY}`
+                        });
+                        if (res.status >= 200 && res.status < 300) {
+                            console.log("Agnes API is available.");
+                            OK = true;
+                            GM_setValue("apiKeyAgnes", API_KEY);
+                        } else {
+                            console.warn("Agnes API returned an error status:", res.status);
                         }
-                    });
-                    document.body.appendChild(restoreSpot);
-                } else {
-                    restoreSpot.style.display = 'block';
-                }
-            } else {
-                if (restoreSpot) restoreSpot.style.display = 'none';
-                setMinimized(prePanicMinimized);
-                mainSolver(status);
-            }
-        }
-
-        panicBtn.onclick = togglePanic;
-
-        origAddEventListener.call(targetWindow, 'keydown', (e) => {
-            if (e.altKey && (e.key === 'x' || e.key === 'X')) {
-                e.preventDefault();
-                togglePanic();
-            }
-        });
-
-        // Initialize minimize state
-        setMinimized(config.minimized);
-
-        // View States
-        function showKeyView() {
-            status.textContent = "🔑 Nhập API Key";
-            status.style.color = "white";
-            keyContainer.style.display = "block";
-            pinContainer.style.display = "none";
-            settingsContainer.style.display = "none";
-            cheatsheetBtn.style.display = "none";
-        }
-
-        function showPinView(showCancel = false) {
-            status.textContent = "🎮 Nhập mã phòng";
-            status.style.color = "white";
-            keyContainer.style.display = "none";
-            pinContainer.style.display = "block";
-            settingsContainer.style.display = "none";
-            cheatsheetBtn.style.display = "none";
-
-            const cancelRow = document.getElementById('pin-cancel-row');
-            if (cancelRow) {
-                cancelRow.style.display = (showCancel && cachedAnswers.size > 0) ? 'flex' : 'none';
-            }
-            if (loadBtn) {
-                loadBtn.disabled = false;
-                loadBtn.textContent = 'Tải';
-            }
-            setTimeout(() => {
-                if (pinInput) {
-                    pinInput.focus();
-                    pinInput.select();
-                }
-            }, 60);
-        }
-
-        // Settings change listeners
-        autoChk.onchange = () => {
-            config.autoSelect = autoChk.checked;
-            saveConfig(config);
-            stopActiveTimer();
-            mainSolver(status);
-        };
-
-        autoNextChk.onchange = () => {
-            config.autoNext = autoNextChk.checked;
-            saveConfig(config);
-        };
-
-        prevBtn.onclick = () => {
-            advancePrevQuestion();
-        };
-
-        nextBtn.onclick = () => {
-            advanceNextQuestion();
-        };
-
-        autofillBtn.onclick = () => {
-            runAutoFillAll(status);
-        };
-
-        const onSpeedUpdate = (deltaMs = 0) => {
-            let val = parseFloat(speedInput.value);
-            if (isNaN(val) || val < 0.2) val = 0.5;
-            config.baseSpeed = val;
-            saveConfig(config);
-            if (activeTimer.intervalId && deltaMs !== 0) {
-                activeTimer.remainingMs = Math.max(100, activeTimer.remainingMs + deltaMs);
-                activeTimer.totalMs = Math.max(activeTimer.remainingMs, activeTimer.totalMs + deltaMs);
-                updateTimerDisplay();
-            } else if (!activeTimer.intervalId) {
-                mainSolver(status);
-            }
-        };
-        speedInput.oninput = () => onSpeedUpdate(0);
-        speedInput.onchange = () => {
-            onSpeedUpdate(0);
-            speedInput.value = config.baseSpeed;
-        };
-
-        speedMinusBtn.onclick = (e) => {
-            if (e) {
-                e.preventDefault();
-                e.stopPropagation();
-            }
-            let cur = parseFloat(speedInput.value) || config.baseSpeed;
-            cur = Math.max(0.5, Math.round((cur - 0.5) * 10) / 10);
-            speedInput.value = cur;
-            onSpeedUpdate(-500);
-        };
-
-        speedPlusBtn.onclick = (e) => {
-            if (e) {
-                e.preventDefault();
-                e.stopPropagation();
-            }
-            let cur = parseFloat(speedInput.value) || config.baseSpeed;
-            cur = Math.min(30, Math.round((cur + 0.5) * 10) / 10);
-            speedInput.value = cur;
-            onSpeedUpdate(500);
-        };
-
-        randChk.onchange = () => {
-            config.randomize = randChk.checked;
-            saveConfig(config);
-            mainSolver(status);
-        };
-
-        dynamicChk.onchange = () => {
-            config.dynamicPacing = dynamicChk.checked;
-            saveConfig(config);
-            mainSolver(status);
-        };
-
-        stealthSelect.onchange = () => {
-            config.stealthLevel = stealthSelect.value;
-            saveConfig(config);
-            const qd = getCurrentQuestionData();
-            if (qd && cachedAnswers.has(qd.questionId)) {
-                highlightCorrectAnswers(cachedAnswers.get(qd.questionId), qd);
-            }
-        };
-
-        // Quiz Cheatsheet Modal Logic
-        function renderCheatSheet(filter = '') {
-            if (!sheetList) return;
-            const normFilter = normalizeText(filter);
-            let itemsHtml = '';
-            let index = 1;
-
-            cachedQuestionsList.forEach(item => {
-                const ans = cachedAnswers.get(item.id);
-                if (!ans) return;
-                const ansDisplay = Array.isArray(ans) ? ans.join(', ') : String(ans);
-                const qPrompt = item.text || item.query?.text || item.structure?.query?.text || '';
-
-                if (normFilter) {
-                    const normAns = normalizeText(ansDisplay);
-                    const normQ = normalizeText(qPrompt);
-                    if (!normAns.includes(normFilter) && !normQ.includes(normFilter)) return;
-                }
-
-                itemsHtml += `
-                    <div class="wg-sheet-item" style="display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.05);">
-                        <span class="wg-sheet-num" style="min-width: 24px; font-weight: 700; color: #a78bfa; font-size: 11px;">#${index}</span>
-                        <div style="flex: 1; display: flex; flex-direction: column; gap: 2px;">
-                            ${qPrompt ? `<div style="color: #94a3b8; font-size: 11px; line-height: 1.3;">${cleanTextForDisplay(qPrompt)}</div>` : ''}
-                            <span class="wg-sheet-ans" style="color: #50fa7b; font-weight: 600; font-size: 12px;">${cleanTextForDisplay(ansDisplay)}</span>
-                        </div>
-                    </div>
-                `;
-                index++;
-            });
-
-            sheetList.innerHTML = itemsHtml || '<div style="color:#94a3b8; font-size:12px; padding:10px; text-align:center;">Không tìm thấy đáp án phù hợp</div>';
-        }
-
-        cheatsheetBtn.onclick = () => {
-            renderCheatSheet(sheetSearch.value);
-            cheatsheetModal.style.display = 'flex';
-            sheetSearch.focus();
-        };
-
-        closeSheetBtn.onclick = () => {
-            cheatsheetModal.style.display = 'none';
-        };
-
-        cheatsheetModal.onclick = (e) => {
-            if (e.target === cheatsheetModal) {
-                cheatsheetModal.style.display = 'none';
-            }
-        };
-
-        sheetSearch.oninput = () => {
-            renderCheatSheet(sheetSearch.value);
-        };
-
-        // Load Answers Action
-        let isAnswersLoaded = false;
-        let isLoadingAnswers = false;
-
-        const runLoadAnswers = async (manualClick = false) => {
-            if (isLoadingAnswers) return;
-            if (!manualClick && isAnswersLoaded) return;
-
-            const pin = pinInput.value.trim().replace(/\s+/g, '');
-            if (!pin) {
-                status.textContent = "⚠️ Vui lòng nhập PIN";
-                status.style.color = '#facc15';
-                if (pinInput) pinInput.focus();
-                return;
-            }
-
-            isLoadingAnswers = true;
-            if (loadBtn) {
-                loadBtn.disabled = true;
-                loadBtn.textContent = '⏳';
-            }
-            status.textContent = "⏳ Đang tải đáp án...";
-            status.style.color = '#38bdf8';
-
-            try {
-                // If switching rooms or manual click, clear stale answers
-                cachedAnswers.clear();
-                cachedQuestionsList = [];
-                lastQuestionFingerprint = '';
-
-                const success = await fetchAndCacheAnswers(pin, status);
-                if (success) {
-                    isAnswersLoaded = true;
-                    safeSetStorage(PIN_STORAGE_KEY, pin);
-                    pinContainer.style.display = 'none';
-                    settingsContainer.style.display = 'block';
-                    status.textContent = "🚀 Sẵn sàng!";
-                    status.style.color = 'white';
-
-                    // Update mini-icon to reflect ready state
-                    miniIcon.style.borderColor = 'rgba(34, 197, 94, 0.5)';
-                    miniIcon.style.color = '#50fa7b';
-
-                    // Enable Cheatsheet button
-                    cheatsheetBtn.style.display = 'block';
-                    cheatsheetBtn.textContent = `📋 Xem Toàn Bộ Đáp Án (${cachedAnswers.size} câu)`;
-
-                    // Ensure Question 1 or active question is solved immediately!
-                    const bootstrapSolve = (retry = 0) => {
-                        const qd = getCurrentQuestionData();
-                        if (qd) {
-                            checkQuestionChange(status);
-                        } else if (retry < 12) {
-                            setTimeout(() => bootstrapSolve(retry + 1), 250);
+                    } else if (provider === "gemini") {
+                        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`);
+                        if (res.ok) {
+                            console.log("Gemini API is available.");
+                            OK = true;
+                            GM_setValue("apiKeyGemini", API_KEY);
+                        } else {
+                            console.warn("Gemini API returned an error status:", res.status);
                         }
-                    };
-                    bootstrapSolve();
+
+                    } else if (provider === "gpt") {
+                        const res = await fetch('https://api.openai.com/v1/models', {
+                            method: 'GET',
+                            headers: {
+                                'Authorization': `Bearer ${API_KEY}`
+                            }
+                        });
+                        if (res.ok) {
+                            console.log("OpenAI API is available.");
+                            OK = true;
+                            GM_setValue("apiKeyGpt", API_KEY);
+                        } else {
+                            console.warn("OpenAI API returned an error status:", res.status);
+                        }
+                    }
+                } catch (err) {
+                    console.error("No response received from server:", err);
+                    OK = false;
+                } finally {
+                    testApiBtn.textContent = 'Test API';
+                    testApiBtn.disabled = false;
+
+                    if (OK) {
+                        apiStatusDot.style.backgroundColor = 'green';
+                        if (typeof mainStatusDot !== 'undefined') mainStatusDot.style.backgroundColor = 'green';
+                        apiStatusText.textContent = 'Connected';
+                    } else {
+                        apiStatusDot.style.backgroundColor = 'red';
+                        if (typeof mainStatusDot !== 'undefined') mainStatusDot.style.backgroundColor = 'red';
+                        apiStatusText.textContent = 'Failed';
+                    }
+                }
+            }
+
+            testApiBtn?.addEventListener('click', testApi);
+
+            function toggleAiState() {
+                if (!toggleAiCheckbox || !mainStatusDot) return;
+                const isEnabled = toggleAiCheckbox.checked;
+                GM_setValue("aiAssistance", isEnabled);
+                if (isEnabled && apiKey.value) {
+                    testApi();
                 } else {
-                    isAnswersLoaded = false;
-                    if (status.textContent.includes('Đang tải')) {
-                        status.textContent = "❌ Không tìm thấy mã PIN";
-                        status.style.color = '#ff5555';
+                    apiStatusDot.style.backgroundColor = 'gray';
+                    mainStatusDot.style.backgroundColor = 'gray';
+                    apiStatusText.textContent = 'Disabled';
+                }
+            }
+
+            toggleAiCheckbox?.addEventListener('change', toggleAiState);
+            const aiEnabledSaved = GM_getValue("aiAssistance", false);
+            if (toggleAiCheckbox) toggleAiCheckbox.checked = aiEnabledSaved;
+            toggleAiState();
+
+            function toggleAnswersEn() {
+                const checkmark = document.querySelector('.ans-check');
+                const subtle = document.querySelector('.subtle-answer-text');
+                if (toggleAns.checked) {
+                    html.style.setProperty('--color-cheat', 'var(--color-picked-user)');
+                    if(checkmark){
+                        checkmark.style.setProperty('opacity', 1);
+                    }
+                    if(subtle){
+                        subtle.style.setProperty('opacity', 1);
+                        subtle.style.setProperty('display', 'block');
+                    }
+                } else {
+                    html.style.setProperty('--color-cheat', 'currentColor');
+                    if(checkmark){
+                        checkmark.style.setProperty('opacity', 0);
+                    }
+                    if(subtle){
+                        subtle.style.setProperty('display', 'none');
                     }
                 }
-            } catch (err) {
-                isAnswersLoaded = false;
-                status.textContent = "❌ Lỗi: " + (err.message || 'Không tải được');
-                status.style.color = '#ff5555';
-            } finally {
-                isLoadingAnswers = false;
-                if (loadBtn) {
-                    loadBtn.disabled = false;
-                    loadBtn.textContent = 'Tải';
-                }
-            }
-        };
-
-        loadBtn.onclick = (e) => {
-            if (e) {
-                e.preventDefault();
-                e.stopPropagation();
-            }
-            runLoadAnswers(true);
-        };
-
-        pinInput.onkeydown = (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                runLoadAnswers(true);
-            }
-        };
-
-        pinInput.oninput = () => {
-            isAnswersLoaded = false;
-        };
-
-        if (changePinBtn) {
-            changePinBtn.onclick = () => {
-                isAnswersLoaded = false;
-                stopActiveTimer();
-                stopAutoFill();
-                showPinView(true);
+                GM_setValue("ansEnabled", toggleAns.checked);
             };
-        }
 
-        if (cancelPinBtn) {
-            cancelPinBtn.onclick = () => {
-                if (cachedAnswers.size > 0) {
-                    pinContainer.style.display = 'none';
-                    settingsContainer.style.display = 'block';
-                    cheatsheetBtn.style.display = 'block';
-                    status.textContent = "🚀 Sẵn sàng!";
-                    status.style.color = 'white';
-                    mainSolver(status);
-                }
+            function changeColorMode() {
+                setTheme(toggleAnsDark.checked);
+                GM_setValue("darkMode", toggleAnsDark.checked);
             };
+
+            toggleAns.addEventListener('change', toggleAnswersEn);
+            const ansEnabled = GM_getValue("ansEnabled");
+            toggleAns.checked = ansEnabled;
+
+            toggleAnsDark.addEventListener('change', changeColorMode);
+            const darkModeSaved = GM_getValue("darkMode");
+            toggleAnsDark.checked = darkModeSaved;
+            toggleAnswersEn();
+            //changeColorMode();
+
+            const versionBadge = shadow.querySelector('#script-version');
+            if (versionBadge && typeof GM_info !== 'undefined') {
+                versionBadge.textContent = "VERSION " + GM_info.script.version;
+            }
+
+        } catch (e) {
+            showNotification("Error injecting the shadow DOM", "#af4c4c");
+            console.error("Error injecting the shadow DOM:", e);
         }
+    }
 
-        const onSaveKey = async () => {
-            const k = keyInput.value.trim();
-            if (!k) return;
-            saveKeyBtn.disabled = true;
-            if (await authenticateWithKey(k, status)) {
-                status.textContent = "✅ Key OK";
-                status.style.color = '#50fa7b';
-                setTimeout(showPinView, 600);
-            } else {
-                status.textContent = "❌ Key không đúng";
-                status.style.color = '#ff5555';
-                saveKeyBtn.disabled = false;
-            }
-        };
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', toLoad);
+    } else {
+        toLoad();
+    }
 
-        saveKeyBtn.onclick = onSaveKey;
-        keyInput.onkeydown = (e) => {
-            if (e.key === 'Enter') onSaveKey();
-        };
+    const SHIELD_PATHS = {
+        true: "m438-338 226-226-57-57-169 169-84-84-57 57 141 141Zm42 258q-139-35-229.5-159.5T160-516v-244l320-120 320 120v244q0 152-90.5 276.5T480-80Zm0-84q104-33 172-132t68-220v-189l-240-90-240 90v189q0 121 68 220t172 132Zm0-316Z",
+        false: "M508.5-331.5Q520-343 520-360t-11.5-28.5Q497-400 480-400t-28.5 11.5Q440-377 440-360t11.5 28.5Q463-320 480-320t28.5-11.5ZM440-480h80v-200h-80v200Zm40 400q-139-35-229.5-159.5T160-516v-244l320-120 320 120v244q0 152-90.5 276.5T480-80Zm0-84q104-33 172-132t68-220v-189l-240-90-240 90v189q0 121 68 220t172 132Zm0-316Z"
+    };
 
-        changeKeyBtn.onclick = () => {
-            safeRemoveStorage(STORAGE_KEY);
-            safeRemoveStorage(PIN_STORAGE_KEY);
-            currentApiKey = '';
-            isAnswersLoaded = false;
-            cachedAnswers.clear();
-            cachedQuestionsList = [];
-            lastQuestionFingerprint = '';
-            showKeyView();
-        };
-
-        // Continuous PIN Poller until found & loaded
-        let pinPoller = null;
-        const checkAndApplyPin = () => {
-            if (isAnswersLoaded || isLoadingAnswers) {
-                if (pinPoller) clearInterval(pinPoller);
-                return true;
-            }
-            const detectedPin = findGamePin();
-            if (detectedPin) {
-                pinInput.value = detectedPin;
-                if (currentApiKey) {
-                    if (pinPoller) {
-                        clearInterval(pinPoller);
-                        pinPoller = null;
-                    }
-                    status.textContent = "✅ Thấy PIN: " + detectedPin;
-                    status.style.color = "#50fa7b";
-                    runLoadAnswers();
-                }
-                return true;
-            }
-            return false;
-        };
-
-        // DOM Mutation Observer for question transitions
-        let isObserverProcessing = false;
-        const observer = new MutationObserver((mutations) => {
-            if (isObserverProcessing) return;
-
-            // Filter out mutations that originated exclusively inside tool elements
-            const hasExternalMutation = mutations.some(m => {
-                const target = m.target;
-                if (!target) return false;
-                if (target.nodeType === 3) {
-                    return !target.parentElement?.closest('#solver-panel, #solver-mini-icon, #wg-cheatsheet-modal, [data-wg-tool]');
-                }
-                if (target.closest) {
-                    return !target.closest('#solver-panel, #solver-mini-icon, #wg-cheatsheet-modal, [data-wg-tool]');
-                }
-                return true;
-            });
-
-            if (!hasExternalMutation) return;
-
-            isObserverProcessing = true;
-            try {
-                checkQuestionChange(status);
-                if (!isAnswersLoaded && !isLoadingAnswers) {
-                    checkAndApplyPin();
-                }
-            } finally {
-                isObserverProcessing = false;
-            }
-        });
-        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-
-        // Keyboard navigation listeners: ArrowRight / ArrowLeft
-        origAddEventListener.call(targetWindow, 'keyup', (e) => {
-            if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
-                setTimeout(() => checkQuestionChange(status), 250);
-            }
-        });
-
-        // Navigation hotkeys: Alt + Left (Prev), Alt + Right (Next)
-        origAddEventListener.call(targetWindow, 'keydown', (e) => {
-            if (e.altKey && (e.key === 'ArrowLeft' || e.code === 'ArrowLeft')) {
-                e.preventDefault();
-                advancePrevQuestion();
-            } else if (e.altKey && (e.key === 'ArrowRight' || e.code === 'ArrowRight')) {
-                e.preventDefault();
-                advanceNextQuestion();
-            }
-        });
-
-        // Intercept clicks on web buttons that might trigger question changes
-        origAddEventListener.call(targetWindow, 'click', (e) => {
-            if (e.target && !e.target.closest('#solver-panel, #solver-mini-icon, #wg-cheatsheet-modal, [data-wg-tool]')) {
-                setTimeout(() => checkQuestionChange(status), 300);
-            }
-        }, true);
-
-        // Initialize state & start PIN detection
-        if (currentApiKey) {
-            showPinView();
-            if (!checkAndApplyPin()) {
-                pinPoller = setInterval(() => {
-                    if (checkAndApplyPin()) {
-                        clearInterval(pinPoller);
-                        pinPoller = null;
-                    }
-                }, 300);
-                setTimeout(() => {
-                    if (pinPoller) clearInterval(pinPoller);
-                }, 30000);
+    function updateAntiCheatUI(isActive) {
+        const card = (typeof shadow !== 'undefined' ? shadow : document).querySelector('#card-anticheat');
+        if (!card) return;
+        const svg = card.querySelector('.shield');
+        const path = card.querySelector('.shield path');
+        const statusText = card.querySelector('#anticheat-status-display');
+        if (isActive) {
+            svg.style.setProperty('fill', '#39be44');
+            path.setAttribute('d', SHIELD_PATHS.true);
+            if (statusText) {
+                statusText.textContent = 'Safe';
+                statusText.style.color = '#39be44';
             }
         } else {
-            showKeyView();
+            svg.style.setProperty('fill', '#e53935');
+            path.setAttribute('d', SHIELD_PATHS.false);
+            if (statusText) {
+                statusText.textContent = 'Not protected';
+                statusText.style.color = '#e53935';
+            }
         }
     }
 
-    if (document.readyState === 'complete' || document.readyState === 'interactive') {
-        setupUI();
-    } else {
-        setTimeout(setupUI, 500);
+    // GM_xmlhttpRequest promise wrapper for host-permissioned cross-origin calls
+    function GM_xmlhttpRequestPromise(url, method = 'GET', headers = {}, data = null) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method,
+                url,
+                headers: Object.assign({ 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' }, headers),
+                data: data ? JSON.stringify(data) : undefined,
+                onload: (res) => resolve(res),
+                onerror: (err) => reject(err),
+                ontimeout: () => reject(new Error('GM_xmlhttpRequest timed out'))
+            });
+        });
     }
+
+    function fetchQuizData(quizId) {
+        const cleanRoomId = quizId.toString().trim();
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://wayground.com/_gameapi/main/public/v1/students/games/${cleanRoomId}`,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0'
+                },
+                onload: function (response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        const firstKey = Object.keys(data?.data?.quizzes || {})[0];
+
+                        if (!firstKey) {
+                            console.error("No quiz was found in the response.");
+                            reject("No quiz found in the response");
+                            return;
+                        }
+
+                        QUIZ_DATA = data.data.quizzes[firstKey];
+                        resolve(QUIZ_DATA);
+
+                    } catch (e) {
+                        showNotification("Error processing quiz API data", "#af4c4c");
+                        console.error('Error processing quiz API data:', e);
+                        reject(e);
+                    }
+                },
+                onerror: function (err) {
+                    showNotification("GM_xmlhttpRequest failed", "#af4c4c");
+                    console.error("GM_xmlhttpRequest failed", err);
+                    reject(err);
+                }
+            });
+        });
+    }
+
+    // Provider element refs — lazily resolved. The original had `shadow.querySelector(...)`
+    // at top level, which threw on fast loads before toLoad() built the shadow DOM.
+    const getProviderEls = () => {
+        if (!shadow) return null;
+        return {
+            apiProvider: shadow.querySelector('#api-provider-select'),
+            toggleAiCheckbox: shadow.querySelector('#toggle-ai-checkbox'),
+            quizName: shadow.querySelector('#quiz-name-display'),
+            ansListMenu: shadow.querySelector('#answers-list'),
+            quizStatusMenu: shadow.querySelector('#quiz-status-display'),
+            toggleAns: shadow.querySelector('#toggleAns input[type="checkbox"]')
+        };
+    };
+
+    async function startQuizSolver(data) {
+        try {
+            const els = getProviderEls();
+            const { quizName, quizStatusMenu, ansListMenu, toggleAiCheckbox, apiProvider } = els || {};
+
+            updateAntiCheatUI(ANTI_CHEAT)
+            if (quizName) quizName.innerText = QUIZ_NAME;
+
+            await fetchQuizData(data.hash || ROOM_DATA.hash);
+
+            CLEANED_QUESTIONS = cleanQuizData(data.questions || ROOM_DATA.questions);
+            const hash = await generateQuizHash(CLEANED_QUESTIONS)
+            const quizId = QUIZ_DATA.id
+            const quizStorage = GM_getValue(`${quizId}`, null)
+            const quizHashStorage = quizStorage ? quizStorage.hash : null
+
+            const aiEnabled = toggleAiCheckbox?.checked || false;
+            if (aiEnabled && !OK) {
+                await testApi();
+            }
+
+            if(quizStorage != null && hash === quizHashStorage){
+                AI_DATA = quizStorage.answers
+                if(TYPE_QUIZ === 'test'){
+                    highlightCorrectAnswersAiTest(AI_DATA, CLEANED_QUESTIONS)
+                } else {
+                    highlightCorrectAnswersAI(AI_DATA, CLEANED_QUESTIONS);
+                }
+                const finalOutput = await formatQuizResults(AI_DATA, data.questions);
+                const htmlList = Object.entries(finalOutput)
+                .map(([question, answer]) => `
+                    <div class="answer-item" style="margin-bottom: 12px; padding: 8px; border-bottom: 1px solid #eee;">
+                        <p class="text">${question}</p>
+                        <p class="subtextT">${answer}</p>
+                    </div>
+                `)
+
+                .join('');
+                if (quizStatusMenu) quizStatusMenu.innerText = 'Answers available'
+                if (quizStatusMenu) quizStatusMenu.style.color = 'green'
+                if (ansListMenu) ansListMenu.innerHTML = htmlList || '<p>No answers available.</p>';
+                showNotification("Answers retrieved from previous quiz attempt");
+            } else if(aiEnabled && OK){
+                const aiAnswers = await processQuizAi(CLEANED_QUESTIONS);
+                const finalOutput = await formatQuizResults(aiAnswers, data.questions);
+                const htmlList = Object.entries(finalOutput)
+                .map(([question, answer]) => `
+                    <div class="answer-item" style="margin-bottom: 12px; padding: 8px; border-bottom: 1px solid #eee;">
+                        <p class="text">${question}</p>
+                        <p class="subtextT">${answer}</p>
+                    </div>
+                `)
+
+                .join('');
+                if (quizStatusMenu) quizStatusMenu.innerText = 'Answers available'
+                if (quizStatusMenu) quizStatusMenu.style.color = 'green'
+                if (ansListMenu) ansListMenu.innerHTML = htmlList || '<p>No answers available.</p>';
+                showNotification("Answers retrieved successfully");
+            } else {
+                if (quizStatusMenu) quizStatusMenu.innerText = 'Error retrieving answers'
+                if (quizStatusMenu) quizStatusMenu.style.color = 'red'
+                showNotification("Enable and test AI first to get answers", "#FFA500");
+                console.warn("Enable and test AI first");
+            }
+        } catch (error) {
+            showNotification("Error injecting the shadow DOM", "#af4c4c");
+            console.error("Error in the quiz flow:", error);
+        }
+    }
+
+    async function processQuizAi(cleanedQuestionsJson) {
+        if (!QUIZ_DATA || !QUIZ_DATA.id) {
+            console.error("QUIZ_DATA has not been loaded yet.");
+            return;
+        }
+
+        const hash = await generateQuizHash(cleanedQuestionsJson)
+        const quizId = QUIZ_DATA.id
+        const quizStorage = GM_getValue(`${quizId}`, null)
+        const quizHashStorage = quizStorage ? quizStorage.hash : null
+        const els = getProviderEls();
+        const apiProvider = els?.apiProvider?.value || GM_getValue("apiProvider", "agnes");
+
+        try {
+            if (apiProvider === "agnes") {
+                showNotification("Loading answers...", "#FFA500");
+                const answers = await solveQuizWithAgnes(cleanedQuestionsJson);
+                AI_DATA = answers;
+                if (TYPE_QUIZ === 'test') {
+                    highlightCorrectAnswersAiTest(AI_DATA, cleanedQuestionsJson);
+                }else {
+                    highlightCorrectAnswersAI(AI_DATA, cleanedQuestionsJson);
+                }
+                GM_setValue(`${QUIZ_DATA.id}`, {"hash": hash, answers});
+                return AI_DATA;
+            } else if (apiProvider === "gemini") {
+                showNotification("Loading answers...", "#FFA500");
+                const answers = await solveQuizWithGemini(cleanedQuestionsJson);
+                AI_DATA = answers;
+                if (TYPE_QUIZ === 'test') {
+                    highlightCorrectAnswersAiTest(AI_DATA, cleanedQuestionsJson);
+                }else {
+                    highlightCorrectAnswersAI(AI_DATA, cleanedQuestionsJson);
+                }
+                GM_setValue(`${QUIZ_DATA.id}`, {"hash": hash, answers});
+                return AI_DATA;
+            } else if (apiProvider === "gpt") {
+                const answers = await solveQuizWithGPT(cleanedQuestionsJson);
+                AI_DATA = answers
+                highlightCorrectAnswersAI(AI_DATA, cleanedQuestionsJson);
+                GM_setValue(`${QUIZ_DATA.id}`, {"hash": hash, answers});
+                return AI_DATA;
+            }
+        } catch (err) {
+            showNotification("No response received from server.", "#af4c4c");
+            console.error("No response received from server:", err);
+        }
+
+    }
+
+    function cleanQuizData(rawJson) {
+        const cleanedQuestionsJson = {};
+
+        if (!rawJson || typeof rawJson !== 'object') return cleanedQuestionsJson;
+
+        const stripAndDecodeHTML = (htmlString = '') => {
+            if (!htmlString) return '';
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = htmlString;
+            return (tempDiv.textContent || tempDiv.innerText || '').trim();
+        };
+
+        try {
+            for (const [qId, qData] of Object.entries(rawJson)) {
+                const structure = qData?.structure || {};
+                const questionType = qData?.type || structure?.kind || 'MCQ';
+                const queryRaw = structure?.query?.text || '';
+
+                const targetSettings = structure?.targets?.[0]?.settings;
+                const answerLength = targetSettings?.answerLength ||
+                      structure?.settings?.questionMetadata?.answerLength || 0;
+
+                const rawOptions = structure?.options || [];
+                const options = rawOptions.map(opt => ({
+                    id: opt.id || opt._id,
+                    text: stripAndDecodeHTML(opt.text || '')
+                }));
+
+                const itemData = {
+                    type: questionType,
+                    question: stripAndDecodeHTML(queryRaw),
+                    options: options
+                };
+
+                if (answerLength > 0) {
+                    itemData.answerLength = answerLength;
+                }
+
+                cleanedQuestionsJson[qId] = itemData;
+            }
+        } catch (e) {
+            console.error("Error cleaning the questions JSON:", e);
+        }
+
+        return cleanedQuestionsJson;
+    }
+
+    function waitForQuestionElement(selector, attribute = null, timeoutMs = 4000) {
+        return new Promise((resolve) => {
+            const check = () => {
+                const el = document.querySelector(selector);
+                if (el && (!attribute || el.getAttribute(attribute))) {
+                    return el;
+                }
+                return null;
+            };
+
+            const existing = check();
+            if (existing) return resolve(existing);
+
+            let timer = null;
+            const observer = new MutationObserver(() => {
+                const el = check();
+                if (el) {
+                    if (timer) clearTimeout(timer);
+                    observer.disconnect();
+                    resolve(el);
+                }
+            });
+
+            timer = setTimeout(() => {
+                observer.disconnect();
+                resolve(null);
+            }, timeoutMs);
+
+            observer.observe(document.body, { childList: true, subtree: true });
+        });
+    }
+
+    function waitForElement(selector, timeout = 5000) {
+        return new Promise((resolve) => {
+            const el = document.querySelector(selector);
+            if (el) return resolve(el);
+
+            const startTime = Date.now();
+            const interval = setInterval(() => {
+                const element = document.querySelector(selector);
+                if (element) {
+                    clearInterval(interval);
+                    resolve(element);
+                } else if (Date.now() - startTime > timeout) {
+                    clearInterval(interval);
+                    resolve(null);
+                }
+            }, 100);
+        });
+    }
+
+    async function getCurrentQuestionId(cleanedQuestionsJson) {
+        const quesIdEl = document.querySelector('[data-quesid]');
+        if (quesIdEl && quesIdEl.getAttribute('data-quesid')) {
+            return quesIdEl.getAttribute('data-quesid');
+        }
+
+        const questionTextEl = document.querySelector('#questionText .content-slot') ||
+              document.querySelector('[data-testid="question-container-text"]');
+
+        if (questionTextEl) {
+            const domQuestionText = questionTextEl.textContent.trim();
+
+            for (const [qId, qData] of Object.entries(cleanedQuestionsJson)) {
+                if (qData.question && qData.question.includes(domQuestionText) || domQuestionText.includes(qData.question)) {
+                    return qId;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function formatQuizResults(answersMap, questionsObject) {
+        const formattedResults = {};
+        const safeAnswersMap = answersMap?.answers || answersMap || {};
+        const safeQuestionsObj = questionsObject || {};
+
+        const cleanText = (html) => {
+            if (!html) return "";
+            const tempDiv = document.createElement("div");
+            tempDiv.innerHTML = html;
+            return (tempDiv.textContent || tempDiv.innerText || "").replace(/<[^>]*>/g, "").trim();
+        };
+
+        Object.keys(safeQuestionsObj).forEach((qId) => {
+            const qData = safeQuestionsObj[qId];
+
+            const rawQuestion = qData?.question || qData?.structure?.query?.text || "";
+            const questionText = cleanText(rawQuestion);
+
+            if (!questionText) return;
+
+            const aiAnswer = safeAnswersMap[qId];
+
+            const rawOptions = qData?.options || qData?.structure?.options || [];
+            const options = rawOptions.map(opt => ({
+                id: opt.id || opt._id,
+                text: cleanText(opt.text || "")
+            }));
+
+            let answerText = "Answer not founded";
+
+            if (aiAnswer !== undefined && aiAnswer !== null) {
+                if (Array.isArray(aiAnswer)) {
+                    const matchedTexts = options
+                    .filter(opt => aiAnswer.includes(opt.id))
+                    .map(opt => opt.text);
+
+                    answerText = matchedTexts.length > 0 ? matchedTexts.join(" | ") : "Answer not founded";
+                }
+                else if (options.length > 0 && options.some(opt => opt.id === aiAnswer)) {
+                    const selectedOption = options.find(opt => opt.id === aiAnswer);
+                    answerText = selectedOption ? selectedOption.text : aiAnswer;
+                }
+                else {
+                    answerText = typeof aiAnswer === "string" ? cleanText(aiAnswer) : String(aiAnswer);
+                }
+            }
+
+            formattedResults[questionText] = answerText;
+        });
+
+        return formattedResults;
+    }
+
+    let savedQuestions = null;
+
+    async function highlightCorrectAnswersAiTest(aiData, cleanedQuestionsJson) {
+        try {
+            if (!aiData || !cleanedQuestionsJson) return;
+
+            const quizResults = await formatQuizResults(aiData, cleanedQuestionsJson);
+            const element = await waitForElement('[data-testid="read-aloud-container"]');
+            const rawElement = await waitForElement('[data-highlight-block="stem"]');
+            const questionElement = rawElement?.length ? rawElement[0] : rawElement;
+
+            if (!questionElement) return;
+
+            const normalize = (str) => (str || '')
+            .replace(/[\u200B-\u200D\uFEFF]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+            const currentQuestionText = questionElement.textContent.trim();
+            const cleanCurrentText = normalize(currentQuestionText);
+
+            const matchedKey = Object.keys(quizResults).find(
+                (key) => normalize(key) === cleanCurrentText
+            );
+
+            const expectedAnswerText = matchedKey ? quizResults[matchedKey] : undefined;
+            if (!expectedAnswerText) return;
+
+            const currentQuestionEntry = Object.entries(cleanedQuestionsJson).find(
+                ([id, item]) => normalize(item.question) === cleanCurrentText
+            );
+
+            if (!currentQuestionEntry) return;
+
+            const [currentQuestionId, currentQuestionData] = currentQuestionEntry;
+            const questionType = currentQuestionData.type || 'MCQ';
+            if (questionType === 'BLANK') {
+                const container = element.querySelector('[data-testid="text-renderer"]');
+
+                if (container && !container.querySelector('.subtle-answer-text')) {
+                    const formattedAnswer = Array.isArray(expectedAnswerText) ? expectedAnswerText.join(' | ') : expectedAnswerText;
+
+                    const answerDiv = document.createElement('div');
+                    answerDiv.className = 'subtle-answer-text';
+                    answerDiv.textContent = `Possible answer: ${formattedAnswer}`;
+                    answerDiv.style.cssText = `
+                    margin-top: 12px;
+                    font-weight: bold;
+                    color: var(--color-picked-user, #39be44);
+                    pointer-events: none;
+                    font-size: 14px;
+                    opacity: ${typeof toggleAns !== 'undefined' && toggleAns?.checked ? '1' : '0'};
+                `;
+                    container.appendChild(answerDiv);
+                }
+                return;
+            } else if (questionType === 'OPEN' || !currentQuestionData.options?.length) {
+                const container = element.querySelector('[data-testid="text-renderer"]');
+
+                if (container && !container.querySelector('.subtle-answer-text')) {
+                    const formattedAnswer = Array.isArray(expectedAnswerText) ? expectedAnswerText.join(' | ') : expectedAnswerText;
+
+                    const answerDiv = document.createElement('div');
+                    answerDiv.className = 'subtle-answer-text';
+                    answerDiv.textContent = `Possible answer: ${formattedAnswer}`;
+                    answerDiv.style.cssText = `
+                    margin-top: 12px;
+                    font-weight: bold;
+                    color: var(--color-picked-user, #39be44);
+                    pointer-events: none;
+                    font-size: 14px;
+                    opacity: ${typeof toggleAns !== 'undefined' && toggleAns?.checked ? '1' : '0'};
+                `;
+                    container.appendChild(answerDiv);
+                }
+                return;
+            }
+
+
+            const rawAnswers = Array.isArray(expectedAnswerText)
+            ? expectedAnswerText
+            : (typeof expectedAnswerText === 'string' ? expectedAnswerText.split('|') : []);
+
+            const targetAnswersList = rawAnswers.map(ans => normalize(ans));
+
+            const optionButtons = document.querySelectorAll('button[data-testid^="option-trigger-"]');
+
+            optionButtons.forEach((btn) => {
+                const optionTextEl = btn.querySelector('[data-highlight-block^="option:"] p') ||
+                      btn.querySelector('[data-highlight-block^="option:"]');
+
+                if (!optionTextEl) return;
+
+                const currentOptionText = normalize(optionTextEl.textContent);
+
+                if (targetAnswersList.includes(currentOptionText)) {
+                    if (!btn.querySelector('.ans-check')) {
+                        const newCheckmark = document.createElement('span');
+                        newCheckmark.className = 'ans-check';
+                        newCheckmark.innerHTML = '&#10003;';
+                        newCheckmark.style.cssText = `
+                            position: absolute;
+                            color: var(--color-picked-user, #39be44);
+                            top: 8px;
+                            right: 12px;
+                            font-size: 22px;
+                            font-weight: bold;
+                            pointer-events: none;
+                            z-index: 10;
+                            opacity: ${typeof toggleAns !== 'undefined' && toggleAns?.checked ? '1' : '0'};
+                        `;
+
+                        const targetContainer = btn.querySelector('.rounded-assessment-lg') || btn;
+                        if (window.getComputedStyle(targetContainer).position === 'static') {
+                            targetContainer.style.position = 'relative';
+                        }
+
+                        targetContainer.appendChild(newCheckmark);
+                    }
+                }
+            });
+
+        } catch (e) {
+            showNotification("Error processing AI answer", "#af4c4c");
+            console.warn("Error processing AI answer:", e);
+        }
+    }
+
+    async function highlightCorrectAnswersAI(aiData, cleanedQuestionsJson) {
+        try {
+            if (!aiData || !cleanedQuestionsJson) return;
+
+            const containerReady = await waitForQuestionElement(
+                '[data-quesid], [data-testid="question-container"], #questionText',
+                null,
+                4000
+            );
+
+            if (!containerReady) {
+                console.warn("No active question container found.");
+                return;
+            }
+
+            const currentQuestionId = await getCurrentQuestionId(cleanedQuestionsJson);
+            if (!currentQuestionId) {
+                console.warn("Could not link the on-screen question with the JSON.");
+                return;
+            }
+
+            const questionData = cleanedQuestionsJson[currentQuestionId];
+            const aiAnswer = aiData[currentQuestionId];
+            if (!questionData || !aiAnswer) return;
+
+            const questionType = questionData.type || 'MCQ';
+            if (questionType === 'BLANK') {
+                const container = document.querySelector('.drag-drop-text div');
+
+                if (container && !container.querySelector('.subtle-answer-text')) {
+                    const formattedAnswer = Array.isArray(aiAnswer) ? aiAnswer.join(' | ') : aiAnswer;
+
+                    const answerDiv = document.createElement('div');
+                    answerDiv.className = 'subtle-answer-text';
+                    answerDiv.textContent = `Possible answer: ${formattedAnswer}`;
+                    answerDiv.style.cssText = `
+                        margin-top: 12px;
+                        font-weight: bold;
+                        color: var(--color-picked-user, #39be44);
+                        pointer-events: none;
+                        font-size: 14px;
+                        opacity: ${typeof toggleAns !== 'undefined' && toggleAns?.checked ? '1' : '0'};
+                    `;
+                    container.appendChild(answerDiv);
+                }
+                return;
+            } else if (questionType === 'OPEN' || !questionData.options?.length) {
+                const container = document.querySelector('.h-full .flex .flex-col .gap-4');
+
+                if (container && !container.querySelector('.subtle-answer-text')) {
+                    const formattedAnswer = Array.isArray(aiAnswer) ? aiAnswer.join(' | ') : aiAnswer;
+
+                    const answerDiv = document.createElement('div');
+                    answerDiv.className = 'subtle-answer-text';
+                    answerDiv.textContent = `Possible answer: ${formattedAnswer}`;
+                    answerDiv.style.cssText = `
+                        margin-top: 12px;
+                        font-weight: bold;
+                        color: var(--color-picked-user, #39be44);
+                        pointer-events: none;
+                        font-size: 14px;
+                        opacity: ${typeof toggleAns !== 'undefined' && toggleAns?.checked ? '1' : '0'};
+                    `;
+                    container.appendChild(answerDiv);
+                }
+                return;
+            }
+
+            const targetIds = Array.isArray(aiAnswer) ? aiAnswer : [aiAnswer];
+
+            const targetIndices = [];
+            questionData.options.forEach((opt, index) => {
+                if (targetIds.includes(opt.id) || targetIds.includes(opt._id)) {
+                    targetIndices.push(index);
+                }
+            });
+
+            targetIndices.forEach(index => {
+                const correctButton = document.querySelector(`[data-cy="option-${index}"]`) ||
+                      document.querySelector(`[data-testid="option-trigger-${index}"]`);
+
+                if (correctButton && !correctButton.querySelector('.ans-check')) {
+                    const newCheckmark = document.createElement('span');
+                    newCheckmark.className = 'ans-check';
+                    newCheckmark.innerHTML = '&#10003;';
+                    newCheckmark.style.cssText = `
+                        position: absolute;
+                        color: var(--color-picked-user, #39be44);
+                        top: 8px;
+                        left: 12px;
+                        font-size: 22px;
+                        font-weight: bold;
+                        pointer-events: none;
+                        z-index: 10;
+                        opacity: ${typeof toggleAns !== 'undefined' && toggleAns?.checked ? '1' : '0'};
+                    `;
+
+                    const targetContainer = correctButton.querySelector('.rounded-assessment-lg') || correctButton;
+                    if (window.getComputedStyle(targetContainer).position === 'static') {
+                        targetContainer.style.position = 'relative';
+                    }
+
+                    targetContainer.appendChild(newCheckmark);
+                }
+            });
+
+        } catch (e) {
+            showNotification("Error processing AI answer", "#af4c4c");
+            console.warn("Error processing AI answer:", e);
+        }
+    }
+
+    const observer = new MutationObserver(() => {
+        try {
+            if (savedQuestions) highlightCorrectAnswers();
+            if (AI_DATA && (TYPE_QUIZ === 'live' || TYPE_QUIZ === 'mystic_peak' || TYPE_QUIZ === 'team')) highlightCorrectAnswersAI(AI_DATA, CLEANED_QUESTIONS);
+            if (AI_DATA && TYPE_QUIZ === 'test') highlightCorrectAnswersAiTest(AI_DATA, CLEANED_QUESTIONS);
+        } catch (e) {
+            console.error("MutationObserver error:", e);
+        }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // ** Agnes — OpenAI-compatible chat completions. Use any sk- key from agnes.ai. **
+    async function solveQuizWithAgnes(questionsJsonObject) {
+        const url = `${AGNES_BASE}/chat/completions`;
+
+        const systemInstruction = `
+            You are an expert quiz-solving assistant.
+            You will receive a JSON object where each question has a "type", "question", "options" array, and optionally "answerLength".
+
+            CRITICAL RULES ACCORDING TO "type":
+            1. For "MCQ":
+            - Select the SINGLE correct option ID (string).
+            2. For "MSQ" (Multiple Select Question):
+            - Select ALL correct option IDs and return them as an ARRAY of strings (e.g., ["ID_1", "ID_2"]).
+            3. For "BLANK" or "OPEN":
+            - Provide a concise text answer in plain text.
+            - VERY IMPORTANT: If "answerLength" is provided, your answer MUST be EXACTLY that many characters long (excluding trailing/leading spaces). For instance, for length 11, "Mitocondria" has 11 characters.
+
+            Respond ONLY in JSON format following this exact structure:
+            {
+            "answers": {
+                "QUESTION_ID": "SINGLE_ID_OR_TEXT_OR_ARRAY_OF_IDS"
+            }
+            }
+        `;
+
+        const payload = {
+            model: AGNES_MODEL,
+            messages: [
+                { role: "system", content: systemInstruction },
+                { role: "user", content: JSON.stringify(questionsJsonObject) }
+            ],
+            response_format: { type: "json_object" },
+            temperature: 0.1
+        };
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: url,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${API_KEY}`
+                },
+                data: JSON.stringify(payload),
+                timeout: 60000,
+                onload: function(response) {
+                    try {
+                        const jsonResponse = JSON.parse(response.responseText);
+
+                        if (jsonResponse.error) {
+                            console.error("Error returned by Agnes API:", jsonResponse.error);
+                            showNotification(`Agnes API error: ${jsonResponse.error?.message || jsonResponse.error}`, "#af4c4c");
+                            reject(`Agnes API error: ${jsonResponse.error?.message || jsonResponse.error}`);
+                            return;
+                        }
+
+                        if (!jsonResponse.choices || jsonResponse.choices.length === 0) {
+                            showNotification("Agnes returned no response (empty choices).", "#af4c4c");
+                            console.error("Response contains no choices:", jsonResponse);
+                            reject("Agnes returned no response (empty choices).");
+                            return;
+                        }
+
+                        const choice = jsonResponse.choices[0];
+                        if (choice.message && choice.message.content) {
+                            const parsedAnswers = JSON.parse(choice.message.content);
+                            resolve(parsedAnswers.answers || parsedAnswers);
+                        } else {
+                            showNotification("Choice format does not contain content.", "#af4c4c");
+                            console.error("Unexpected choice structure:", choice);
+                            reject("Choice format does not contain content.");
+                        }
+
+                    } catch (e) {
+                        showNotification("Raw response received from server.", "#af4c4c");
+                        console.error("Raw response received from server:", response.responseText);
+                        reject("Error parsing response: " + e.message);
+                    }
+                },
+                onerror: function(error) {
+                    showNotification("Error in solveQuizWithAgnes", "#af4c4c");
+                    reject(error);
+                },
+                ontimeout: function() {
+                    showNotification("Agnes API timed out", "#af4c4c");
+                    reject("Agnes API timed out");
+                }
+            });
+        });
+    }
+
+    async function solveQuizWithGPT(questionsJsonObject) {
+        const url = "https://api.openai.com/v1/chat/completions";
+
+        const systemInstruction = `
+            You are an expert quiz-solving assistant.
+            You will receive a JSON object containing questions and their respective options.
+            For each question, identify the ID of the correct option (_id or id).
+            Respond ONLY in JSON format matching the structure {"answers": {"QUESTION_ID": "CORRECT_OPTION_ID"}}.
+        `;
+
+        const payload = {
+            model: "gpt-4o-mini",
+            messages: [
+                { role: "system", content: systemInstruction },
+                { role: "user", content: JSON.stringify(questionsJsonObject) }
+            ],
+            response_format: { type: "json_object" },
+            temperature: 0.1
+        };
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: url,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${API_KEY}`
+                },
+                data: JSON.stringify(payload),
+                onload: function(response) {
+                    try {
+                        const jsonResponse = JSON.parse(response.responseText);
+
+                        if (jsonResponse.error) {
+                            console.error("Error returned by OpenAI API:", jsonResponse.error);
+                            showNotification(`Error returned by OpenAI API: ${jsonResponse.error?.message || jsonResponse.error}`, "#af4c4c");
+                            reject(`OpenAI Error (${jsonResponse.error.type}): ${jsonResponse.error.message}`);
+                            return;
+                        }
+
+                        if (!jsonResponse.choices || jsonResponse.choices.length === 0) {
+                            showNotification("OpenAI returned no response (empty choices).", "#af4c4c");
+                            console.error("Response contains no choices:", jsonResponse);
+                            reject("OpenAI returned no response (empty choices).");
+                            return;
+                        }
+
+                        const choice = jsonResponse.choices[0];
+                        if (choice.message && choice.message.content) {
+                            const parsedAnswers = JSON.parse(choice.message.content);
+                            resolve(parsedAnswers.answers || parsedAnswers);
+                        } else {
+                            showNotification("Choice format does not contain content.", "#af4c4c");
+                            console.error("Unexpected choice structure:", choice);
+                            reject("Choice format does not contain content.");
+                        }
+
+                    } catch (e) {
+                        showNotification("Raw response received from server.", "#af4c4c");
+                        console.error("Raw response received from server:", response.responseText);
+                        reject("Error parsing response: " + e.message);
+                    }
+                },
+                onerror: function(error) {
+                    showNotification("Error in solveQuizWithGPT", "#af4c4c");
+                    reject(error);
+                }
+            });
+        });
+    }
+
+    async function solveQuizWithGemini(questionsJsonObject) {
+
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${API_KEY}`;
+
+        const systemInstruction = `
+            You are an expert quiz-solving assistant.
+            You will receive a JSON object where each question has a "type", "question", "options" array, and optionally "answerLength".
+
+            CRITICAL RULES ACCORDING TO "type":
+            1. For "MCQ":
+            - Select the SINGLE correct option ID (string).
+            2. For "MSQ" (Multiple Select Question):
+            - Select ALL correct option IDs and return them as an ARRAY of strings (e.g., ["ID_1", "ID_2"]).
+            3. For "BLANK" or "OPEN":
+            - Provide a concise text answer in plain text.
+            - VERY IMPORTANT: If "answerLength" is provided, your answer MUST be EXACTLY that many characters long (excluding trailing/leading spaces). For instance, for length 11, "Mitocondria" has 11 characters.
+
+            Respond ONLY in JSON format following this exact structure:
+            {
+            "answers": {
+                "QUESTION_ID": "SINGLE_ID_OR_TEXT_OR_ARRAY_OF_IDS"
+            }
+            }
+        `;
+        const payload = {
+            contents: [{
+                parts: [{ text: JSON.stringify(questionsJsonObject) }]
+            }],
+            systemInstruction: {
+                parts: [{ text: systemInstruction }]
+            },
+            generationConfig: {
+                responseMimeType: "application/json",
+                temperature: 0.1
+            }
+        };
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: url,
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                data: JSON.stringify(payload),
+                onload: function(response) {
+                    try {
+                        const jsonResponse = JSON.parse(response.responseText);
+
+                        if (jsonResponse.error) {
+                            console.error("Error returned by Gemini API:", jsonResponse.error);
+                            showNotification(`Gemini API error (${jsonResponse.error.code}): ${jsonResponse.error.message}`, "#af4c4c");
+                            reject(`Gemini API error (${jsonResponse.error.code}): ${jsonResponse.error.message}`);
+                            return;
+                        }
+
+                        if (!jsonResponse.candidates || jsonResponse.candidates.length === 0) {
+                            console.error("Response contains no candidates:", jsonResponse);
+                            showNotification("Gemini returned no response (empty candidate).", "#af4c4c");
+                            reject("Gemini returned no response (empty candidate).");
+                            return;
+                        }
+
+                        const candidate = jsonResponse.candidates[0];
+                        if (candidate.content && candidate.content.parts && candidate.content.parts[0]) {
+                            const rawText = candidate.content.parts[0].text;
+                            const parsedAnswers = JSON.parse(rawText);
+                            resolve(parsedAnswers.answers || parsedAnswers);
+                        } else {
+                            showNotification("Candidate format does not contain text parts.", "#af4c4c");
+                            console.error("Unexpected candidate structure:", candidate);
+                            reject("Candidate format does not contain text parts.");
+                        }
+
+                    } catch (e) {
+                        showNotification("Raw response received from server.", "#af4c4c");
+                        console.error("Raw response received from server:", response.responseText);
+                        reject("Error parsing response: " + e.message);
+                    }
+                },
+                onerror: function(error) {
+                    reject(error);
+                }
+            });
+        });
+    }
+
+    try {
+        console.log("%cProtection enabled", "color: #ff00ff; font-weight: bold;");
+        const mockProperty = (obj, prop, val) => {
+            try {
+                Object.defineProperty(obj, prop, {
+                    get: () => val,
+                    configurable: true
+                });
+            } catch (e) {
+                console.warn(`Could not mock ${prop} on`, obj, e);
+            }
+        };
+
+        mockProperty(document, 'fullscreenElement', document.documentElement);
+        mockProperty(document, 'visibilityState', 'visible');
+        mockProperty(document, 'hidden', false);
+
+        const style = document.createElement('style');
+
+        style.innerHTML = `
+            * {
+                user-select: text !important;
+                -webkit-user-select: text !important;
+            }
+        `;
+
+        document.head.appendChild(style);
+
+        const interceptEvent = (type) => {
+            window.addEventListener(type, (e) => {
+                try {
+                    e.stopImmediatePropagation();
+                } catch (e) {
+                    console.error("Event interception error:", e);
+                }
+            }, true);
+        };
+
+        ['fullscreenchange', 'blur', 'visibilitychange', 'mouseout']
+            .forEach(interceptEvent);
+
+        const originalFetch = window.fetch;
+
+        window.fetch = async (...args) => {
+            try {
+                const config = args[1];
+                if (
+                    config?.body &&
+                    (
+                        config.body.includes("infraction") ||
+                        config.body.includes("fullscreenExit")
+                    )
+                ) {
+                    return new Response(
+                        JSON.stringify({ success: true }),
+                        { status: 200 }
+                    );
+                }
+            } catch (e) {
+                console.error("Fetch interceptor error:", e);
+            }
+            return originalFetch(...args);
+        };
+    } catch (e) {
+        console.error("Visibility protection error:", e);
+    }
+
+    function showNotification(message, color = '#4caf50') {
+        let container = document.getElementById('toast-container');
+
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'toast-container';
+            Object.assign(container.style, {
+                position: 'fixed',
+                top: '20px',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: '10px',
+                zIndex: '9999',
+                pointerEvents: 'none'
+            });
+            document.body.appendChild(container);
+        }
+
+        const toast = document.createElement('div');
+        Object.assign(toast.style, {
+            backgroundColor: color,
+            color: 'white',
+            padding: '12px 24px',
+            borderRadius: '8px',
+            fontSize: '16px',
+            fontWeight: 'bold',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+            fontFamily: 'sans-serif',
+            pointerEvents: 'auto',
+            opacity: '0',
+            transform: 'translateY(-10px)',
+            transition: 'all 0.3s ease'
+        });
+
+        toast.innerText = message;
+
+        container.prepend(toast);
+
+        requestAnimationFrame(() => {
+            toast.style.opacity = '1';
+            toast.style.transform = 'translateY(0)';
+        });
+
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            toast.style.transform = 'translateY(-10px)';
+
+            setTimeout(() => {
+                toast.remove();
+
+                if (container.children.length === 0) {
+                    container.remove();
+                }
+            }, 300);
+        }, 3000);
+    }
+
+    async function generateQuizHash(questionsJsonObject) {
+        try {
+            if (!questionsJsonObject || typeof questionsJsonObject !== 'object') {
+                return null;
+            }
+
+            const sortedQuestionIds = Object.keys(questionsJsonObject).sort();
+            const idCanonicalString = sortedQuestionIds.join('|');
+            const msgUint8 = new TextEncoder().encode(idCanonicalString);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            const finalHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+            return finalHash;
+        } catch (e) {
+            showNotification("Error hashing the JSON", "#af4c4c");
+            console.warn("Error hashing the JSON:", e);
+        }
+    }
+
+    function fetchQuizAnswers(quizId) {
+        const cleanRoomId = quizId.toString().trim();
+        try {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://wayground.com/api/main/quiz/${cleanRoomId}`,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0'
+                },
+                onload: function (response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (data.success && data.data?.quiz?.info?.questions) {
+                            savedQuestions = data.data.quiz.info.questions;
+                            highlightCorrectAnswers();
+                            console.log("Answers retrieved successfully.");
+                            showNotification("Answers retrieved successfully.");
+                        }
+                    } catch (e) {
+                        showNotification("Failed to retrieve answers", "#af4c4c");
+                        console.error('Error parsing API answers:', e);
+                    }
+                },
+                onerror: (err) => {
+                    showNotification("Failed to retrieve answers", "#af4c4c");
+                    console.error("GM_xmlhttpRequest failed", err);
+                }
+            });
+        } catch (e) {
+            showNotification("Failed to retrieve answers", "#af4c4c");
+            console.error("Could not execute GM_xmlhttpRequest:", e);
+        }
+    }
+
+    function highlightCorrectAnswers() {
+        try {
+            if (!savedQuestions) return;
+            const questionContainer = document.querySelector('[data-quesid]');
+            const currentQuestionId = questionContainer?.getAttribute('data-quesid');
+            if (currentQuestionId) {
+                const questionData = savedQuestions.find((q) => q._id === currentQuestionId);
+                if (questionData && questionData.structure.settings.hasCorrectAnswer) {
+                    const rawAnswer = questionData.structure.answer;
+                    if (questionData.type === 'BLANK') {
+                        const correctButton = document.querySelector('.content-slot.resizeable.text-lg.font-semibold:not(.modified)');
+                        if (correctButton) {
+                            const immediateParent = correctButton.parentElement;
+                            if (immediateParent) {
+                                correctButton.classList.add('modified');
+                                const answer = document.createElement('div');
+                                answer.textContent = 'Possible Answer: ' + questionData.structure.options[1].text;
+                                answer.style.opacity = '0.05';
+                                correctButton.appendChild(answer);
+                            }
+                        } else {
+                            const container = document.querySelector('.p-4.sm\\:p-6.h-full.rounded-md.overflow-y-auto');
+                            if (container && !container.querySelector('.subtle-answer-text')) {
+                                const answer = document.createElement('div');
+                                answer.className = 'subtle-answer-text';
+                                answer.textContent = 'Possible Answer: ' + questionData.structure.options[1].text;
+                                answer.style.cssText = `
+                                    margin-top: 10px;
+                                    font-weight: bold;
+                                    pointer-events: none;
+                                    color: var(--color-picked-user, #39be44);
+                                    opacity: ${typeof toggleAns !== 'undefined' && toggleAns?.checked ? '1' : '0'};
+                                `;
+                                container.appendChild(answer);
+                            }
+                        }
+                    }
+                    const answerIndices = Array.isArray(rawAnswer) ? rawAnswer : [rawAnswer];
+                    answerIndices.forEach(index => {
+                        const correctButton = document.querySelector(`[data-cy="option-${index}"]`);
+                        if (correctButton && !correctButton.querySelector('.ans-check')) {
+                            const newCheckmark = document.createElement('span');
+                            newCheckmark.className = 'ans-check';
+                            newCheckmark.innerHTML = '&#10003;';
+                            newCheckmark.style.cssText = `
+                                position: absolute;
+                                color: var(--color-picked-user, #39be44);
+                                top: 8px;
+                                left: 12px;
+                                font-size: 22px;
+                                font-weight: bold;
+                                pointer-events: none;
+                                z-index: 10;
+                                opacity: ${typeof toggleAns !== 'undefined' && toggleAns?.checked ? '1' : '0'};
+                            `;
+                            if (window.getComputedStyle(correctButton).position === 'static') {
+                                correctButton.style.position = 'relative';
+                            }
+                            correctButton.appendChild(newCheckmark);
+                        }
+                    });
+                } else if (questionData?.structure.kind === "OPEN") {
+                    console.log("Open question detected: no automatic answer is available.");
+                }
+            }
+        } catch (e) {
+            console.warn("Error processing question type:", e);
+        }
+    }
+
 })();
